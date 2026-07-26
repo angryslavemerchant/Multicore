@@ -1,0 +1,8 @@
+{
+  "_comment": "Light gate for HF-only percept jobs (train_dino_codebook_icl.py class): no Drive-bank dependency, jpegs decoded ONCE during a single encode pass. drive_pull_mbps dropped entirely (2026-07-21: an otherwise-perfect NL host measured 14 mbps to Drive while pulling 255 from HF — Drive rate-limits the bank account under repeated gate probes, so the check can lock the whole fleet out of jobs that never touch the bank). cpu_jpeg floor lowered 2000->800: decode-once workloads are GPU-bound past ~500 img/s. Hardware floors unchanged. Select via: launch.py launch --thresholds vast/thresholds_hf_light.json",
+  "download_mbps": 120,
+  "disk_write_mbps": 200,
+  "cpu_jpeg_per_sec": 800,
+  "pcie_h2d_gbps": 8.0,
+  "gpu_bf16_tflops": 150
+}

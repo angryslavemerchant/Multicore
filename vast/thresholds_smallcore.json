@@ -1,0 +1,6 @@
+{
+  "_comment": "Boot gate for SmallCore. The project has NO dataset -- walks are generated in-process from a committed 20 KB JSON -- so the download, drive-bank and jpeg-decode tests are skipped entirely (vast/onstart.sh passes --skip download,bank,cpu) and their thresholds are absent here. What remains are broken-hardware floors: a machine that cannot write to disk, cannot move data over PCIe, or cannot run a bf16 matmul is broken, and that is the only thing this gate is for. Floors are deliberately low -- SmallCore is a ~50k-parameter model that is kernel-launch bound rather than FLOP bound, so a slow-but-working GPU costs little. Re-derive with: launch.py scan --n 3.",
+  "disk_write_mbps": 100,
+  "pcie_h2d_gbps": 4.0,
+  "gpu_bf16_tflops": 50
+}

@@ -1,0 +1,5 @@
+# torch is NOT listed: it comes from the vast.ai image (/venv/main) or the
+# local conda env. Reinstalling it on-instance wastes 10+ minutes.
+numpy
+wandb
+matplotlib

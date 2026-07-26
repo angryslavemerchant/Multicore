@@ -1,0 +1,8 @@
+vast/secrets.env
+.vast/
+runs/
+wandb/
+__pycache__/
+*.pyc
+.idea/
+*.pt

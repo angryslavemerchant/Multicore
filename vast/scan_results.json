@@ -1,0 +1,38 @@
+[
+  {
+    "instance": 45290567,
+    "machine_id": 141012,
+    "dph": 0.31268518518518523,
+    "geolocation": ", US",
+    "timestamp": "2026-07-19T07:03:50Z",
+    "download_mbps": 9.4,
+    "download_src": "hf",
+    "drive_pull_mbps": 16.7,
+    "disk_write_mbps": 396.4,
+    "cpu_cores": 192,
+    "cpu_jpeg_per_sec": 7787.6,
+    "np_gflops": 1034.2,
+    "pcie_h2d_gbps": 18.12,
+    "pcie_d2h_gbps": 26.32,
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_bf16_tflops": 228.9
+  },
+  {
+    "instance": 45290572,
+    "machine_id": 59009,
+    "dph": 0.31268518518518523,
+    "geolocation": ", US",
+    "timestamp": "2026-07-19T07:01:39Z",
+    "download_mbps": 20.4,
+    "download_src": "hf",
+    "drive_pull_mbps": 14.2,
+    "disk_write_mbps": 426.7,
+    "cpu_cores": 192,
+    "cpu_jpeg_per_sec": 6885.2,
+    "np_gflops": 687.3,
+    "pcie_h2d_gbps": 16.39,
+    "pcie_d2h_gbps": 26.0,
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_bf16_tflops": 221.2
+  }
+]

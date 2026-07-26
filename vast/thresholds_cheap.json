@@ -1,0 +1,6 @@
+{
+  "_comment": "Boot gate for CHEAP hosts. SmallCore is ~90k parameters and bound by kernel-launch issue rate, not arithmetic, so GPU class is nearly irrelevant -- what matters is single-thread CPU. thresholds_smallcore.json floors bf16 at 50 TFLOPS, which was calibrated on a 5090 (236) and would self-destruct a perfectly usable RTX 3060 (~13) or A4000 (~19) for being 'broken'. These floors only reject genuinely broken hardware: a GPU that cannot run a bf16 matmul at all, a disk that cannot write, a PCIe link that is dead. Select via: launch.py launch --thresholds vast/thresholds_cheap.json",
+  "disk_write_mbps": 50,
+  "pcie_h2d_gbps": 1.5,
+  "gpu_bf16_tflops": 5
+}

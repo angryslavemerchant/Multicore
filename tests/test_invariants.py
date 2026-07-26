@@ -1,0 +1,107 @@
+"""M0/M1/M2 gates. Runnable via pytest or `python tests/test_invariants.py`.
+
+M0 — zero-init cores leave logits bit-identical to the core-free model.
+M1 — gather->window->scatter agrees with the O(T^2) reference mask spec.
+M2 — full prefill logits match token-by-token incremental decode (the cache
+     test: if this fails, an invariant in CORE_ROUTING_PLAN.md section 6 is
+     broken).
+"""
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+from core import CoreConfig, ModelConfig, SWTransformer, Core
+from core.resident import resident_mask_reference, compact_indices, window_mask
+
+torch.manual_seed(0)
+
+
+def small_cfg(n_cores=2, adapter=False):
+    return ModelConfig(
+        vocab_size=96, d_model=64, n_layers=3, n_heads=4, window=16,
+        max_seq_len=256, core_layer=1, adapter=adapter,
+        cores=[CoreConfig(K=4, d_core=32, n_heads=2, target_rate=0.3),
+               CoreConfig(K=8, d_core=32, n_heads=2, target_rate=0.1)][:n_cores])
+
+
+def randomize_core_outputs(model, scale=0.1):
+    """Make deltas nonzero so M1/M2 actually test the core path."""
+    for c in model.cores:
+        torch.nn.init.normal_(c.out_proj.weight, std=scale)
+        torch.nn.init.normal_(c.out_proj.bias, std=scale)
+        # push gate scores around so a healthy fraction of tokens are admitted
+        torch.nn.init.normal_(c.k_dir, std=1.0)
+
+
+def test_m0_bit_identical():
+    model = SWTransformer(small_cfg()).eval()
+    idx = torch.randint(0, 96, (4, 128))
+    with torch.no_grad():
+        logits_with = model(idx)
+        model.cores_enabled = False
+        logits_without = model(idx)
+    assert torch.equal(logits_with, logits_without), "M0 FAILED: zero-init cores changed logits"
+    print("M0 PASSED: zero-init cores are bit-identical to base")
+
+
+def test_m1_mask_equivalence():
+    torch.manual_seed(1)
+    for K in (1, 2, 4, 16):
+        for rate in (0.05, 0.3, 0.9):
+            core = Core(32, CoreConfig(K=K, d_core=16, n_heads=2)).eval()
+            torch.nn.init.normal_(core.out_proj.weight, std=0.1)
+            torch.nn.init.normal_(core.k_dir, std=2.0)
+            core.tau.data.fill_(torch.quantile(
+                torch.randn(1000) * 2.0, 1 - rate))
+            h = torch.randn(3, 48, 32)
+            with torch.no_grad():
+                fast, _ = core(h)
+                ref, _ = core.forward_reference(h)
+            assert torch.allclose(fast, ref, atol=1e-5), \
+                f"M1 FAILED at K={K} rate~{rate}: max err {(fast-ref).abs().max()}"
+    # also test the pure mask logic on random booleans
+    for K in (1, 3, 7):
+        m = torch.rand(64) < 0.4
+        ref = resident_mask_reference(m, K)
+        idx, valid = compact_indices(m[None])
+        wm = window_mask(idx.shape[1], K, valid)[0]
+        # map compacted mask back to full coordinates and compare
+        full = torch.zeros(64, 64, dtype=torch.bool)
+        pos = idx[0]
+        for a in range(idx.shape[1]):
+            if not valid[0, a]:
+                continue
+            for b in range(idx.shape[1]):
+                if valid[0, b] and wm[a, b]:
+                    full[pos[a], pos[b]] = True
+        assert torch.equal(full, ref), f"M1 mask logic FAILED at K={K}"
+    print("M1 PASSED: gather-window-scatter == reference spec")
+
+
+def test_m2_cache_correctness():
+    torch.manual_seed(2)
+    for adapter in (False, True):
+        model = SWTransformer(small_cfg(adapter=adapter)).eval()
+        randomize_core_outputs(model)
+        B, T = 3, 200  # > max ring turnover: rate*T >> K for both cores
+        idx = torch.randint(0, 96, (B, T))
+        with torch.no_grad():
+            full_logits = model(idx)
+            caches = model.init_caches(B, idx.device)
+            steps = [model.forward_step(idx[:, t], caches) for t in range(T)]
+        inc_logits = torch.stack(steps, dim=1)
+        err = (full_logits - inc_logits).abs().max().item()
+        assert err < 1e-4, f"M2 FAILED (adapter={adapter}): max logit err {err}"
+        # confirm cores actually turned over (test would be vacuous otherwise)
+        if not adapter:
+            counts = [int(r["count"].max()) for r in caches["rings"]]
+            assert any(c > k for c, k in zip(counts, (4, 8))), \
+                f"M2 vacuous: rings never filled (counts={counts})"
+    print("M2 PASSED: prefill == incremental decode, cores turning over")
+
+
+if __name__ == "__main__":
+    test_m0_bit_identical()
+    test_m1_mask_equivalence()
+    test_m2_cache_correctness()
+    print("ALL GATES PASSED")
