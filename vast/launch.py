@@ -86,7 +86,7 @@ GPU_PROFILES = {
         "train_frag": "",
     },
 }
-BASE_TRAIN_ARGS = "--iters 8000 --wandb"
+BASE_TRAIN_ARGS = "--stage all --variant core --wandb"
 
 
 def resolve_profile(args):
@@ -413,9 +413,8 @@ def cmd_launch(args):
     if args.train_args is None:
         args.train_args = f"{BASE_TRAIN_ARGS} {prof['train_frag']}"
     if args.smoke:
-        args.train_args = ("--num_epochs 1 --batch_size 256 "
-                           "--data ram --compile_mode default "
-                           "--run_name smoke_test")
+        args.train_args = ("--stage all --variant core --pretrain-iters 300 "
+                           "--iters 300 --run-name smoke_test --wandb")
         args.keep_alive = True
     print(f"Profile {args.profile} ({gpu}, cap ${max_dph}/hr)")
     print(f"  train args: {args.train_args}")
