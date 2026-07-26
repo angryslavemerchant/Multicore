@@ -3,6 +3,24 @@
 The base is architecturally unable to attend past `window` tokens — cores are
 the only long-range channel. Both a full-sequence forward and an incremental
 (KV-cached) decode path are provided; M2 asserts they agree.
+
+Prefill attention is BANDED (see `_sw_band_layout`): the sliding window makes
+the (T, T) attention matrix a causal band of width `window`, so we cut it into
+query blocks and hand SDPA (nb, C, W) blocks instead of one (T, T) problem —
+O(T*window), never O(T*T), in both memory and FLOPs. Same trick the cores use
+on the compacted passer stream (`core_module._banded_attend`); the layouts are
+kept separate because the core band also carries a rank-relative bias and a
+passer-validity mask that mean nothing here.
+
+Passing the dense (T, T) bool mask to `F.scaled_dot_product_attention` was
+costing both, and how badly depends on the build. It always disqualifies the
+flash kernel; where nothing else takes a mask it falls through to the math
+backend, which keeps a (B, H, T, T) probability tensor for backward (402 MB
+per layer at B=4, H=6, T=2048 — measured 5.60 GB peak for the 8-layer base,
+vs 2.69 GB banded). Where a fused masked kernel does exist the memory is fine
+but the FLOPs are still quadratic: the kernel dutifully scores all T keys per
+query and throws away the (1 - window/T) that the mask forbids — measured
+764 ms -> 392 ms per fwd+bwd step at B=4, T=2048, window=256.
 """
 import math
 import torch
@@ -11,6 +29,12 @@ import torch.nn.functional as F
 
 from .config import ModelConfig, CoreConfig
 from .core_module import Core, MultiCore, TokenAdapter
+
+# Query-block size floor for banded attention. C = `window` is the natural
+# block (key window W = 2*window-1 — the least wasted work per query); the
+# floor only stops tiny windows from degenerating into thousands of blocks of
+# a couple of rows each.
+SW_MIN_BLOCK = 64
 
 
 def _rope_cos_sin(d_head, positions):
@@ -28,6 +52,63 @@ def _rope_apply(x, cos, sin):
     out[..., 0::2] = x1 * cos - x2 * sin
     out[..., 1::2] = x1 * sin + x2 * cos
     return out
+
+
+# ------------------------------------------------- banded sliding-window
+def _sw_band_layout(T, window, C, device):
+    """Block-banded layout for causal sliding-window attention.
+
+    Query i attends key j iff `j <= i and i - j < window`, so the attention
+    matrix is a causal band of width `window` and a dense (T, T) mask is pure
+    waste. We walk the band in BLOCKS of C queries: block b owns queries
+    [b*C, b*C+C) and those queries need exactly the contiguous key range
+    [b*C-(window-1), b*C+C), of length W = C+window-1. Every tensor
+    downstream is O(T*W); no (T, T) tensor is ever built.
+
+    Returns (nb, W, Tp, jc, ok):
+      nb   number of blocks, Tp = nb*C the block-padded position axis
+      jc   (nb*W,) long   key index of each window slot, clamped into [0, Tp)
+      ok   (nb, C, W) bool  slot is inside the band and is a real key.
+           The diagonal (j == i) is always on, so padded query rows still
+           have a non-empty softmax (their output is sliced off) — same
+           guard `_banded_attend` uses for padded ranks.
+    """
+    W = C + window - 1
+    nb = (T + C - 1) // C
+    Tp = nb * C
+    j = (torch.arange(nb, device=device)[:, None] * C - (window - 1)
+         + torch.arange(W, device=device)[None, :])           # (nb, W)
+    dlt = (torch.arange(C, device=device)[:, None]
+           - torch.arange(W, device=device)[None, :] + (window - 1))  # i - j
+    band = (dlt >= 0) & (dlt < window)                        # (C, W)
+    ok = (band & (j >= 0)[:, None, :]) | (dlt == 0)[None]     # (nb, C, W)
+    return nb, W, Tp, j.clamp(0, Tp - 1).reshape(-1), ok
+
+
+def _sliding_window_attend(q, k, v, window, C):
+    """Causal window-`window` attention, banded. q, k, v (B, H, T, dh).
+
+    Semantics are exactly the dense mask
+    `(i[:, None] >= i[None, :]) & (i[:, None] - i[None, :] < window)`
+    fed to scaled_dot_product_attention — same attended set, same scaling.
+
+    The blocks go back through SDPA rather than being attended by hand: the
+    block axis rides in the head slot, so SDPA sees (B*H, nb, C, dh) against
+    (B*H, nb, W, dh) under a (1, nb, C, W) mask that broadcasts over B*H, and
+    a fused masked kernel then never materialises even the (nb, C, W) logits.
+    Where no such kernel exists SDPA falls back to math and the peak is
+    O(T*W) — still the smaller problem, by T/W.
+    """
+    B, H, T, dh = q.shape
+    nb, W, Tp, jc, ok = _sw_band_layout(T, window, C, q.device)
+    if Tp != T:                        # pad the position axis to whole blocks
+        pad = (0, 0, 0, Tp - T)
+        q, k, v = F.pad(q, pad), F.pad(k, pad), F.pad(v, pad)
+    qb = q.reshape(B * H, nb, C, dh)          # blocks partition the queries
+    kb = k.index_select(2, jc).view(B * H, nb, W, dh)   # ..and overlap by W-C
+    vb = v.index_select(2, jc).view(B * H, nb, W, dh)
+    out = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=ok[None])
+    return out.reshape(B, H, Tp, dh)[:, :, :T]
 
 
 class SWAttention(nn.Module):
@@ -50,9 +131,15 @@ class SWAttention(nn.Module):
         if self.rope:
             cos, sin = _rope_cos_sin(self.d_head, torch.arange(T, device=x.device))
             q, k = _rope_apply(q, cos, sin), _rope_apply(k, cos, sin)
-        i = torch.arange(T, device=x.device)
-        mask = (i[:, None] >= i[None, :]) & (i[:, None] - i[None, :] < self.window)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        if self.window >= T:
+            # the window covers the whole sequence (the *_dense_full presets
+            # set window=T): the band IS the causal mask, and is_causal says
+            # so in the one way that leaves every SDPA kernel eligible.
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            out = _sliding_window_attend(
+                q, k, v, self.window,
+                min(max(self.window, SW_MIN_BLOCK), T))
         return self.proj(out.transpose(1, 2).reshape(B, T, C))
 
     def step(self, x, cache, t):
