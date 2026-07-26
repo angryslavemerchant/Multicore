@@ -6,6 +6,7 @@ class CoreConfig:
     K: int = 16                 # slots (FIFO depth in passer space)
     d_core: int = 128           # internal width
     n_heads: int = 4
+    n_core_layers: int = 2      # depth of the mini-transformer over the FIFO
     ffn_mult: int = 4
     target_rate: float = 0.06   # target admission rate
     gate_temp: float = 1.0      # temperature of the soft magnitude gate
