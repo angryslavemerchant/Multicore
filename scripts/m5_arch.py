@@ -30,23 +30,27 @@ from core import CoreConfig, ModelConfig, SWTransformer
 
 
 def presets(T):
-    hefty = CoreConfig(K=64, d_core=768, n_heads=8, ffn_mult=4,
-                       target_rate=1 / 8)
+    # north star: MOST params in the cores, activated for a fraction of
+    # tokens. Two hefty cores at rate 1/8 with independent gates.
+    hefty = CoreConfig(K=64, d_core=1024, n_heads=8, ffn_mult=4,
+                       n_core_layers=2, target_rate=1 / 8)
     memory = CoreConfig(K=64, d_core=128, n_heads=4, ffn_mult=2,
-                        target_rate=1 / 64)
+                        n_core_layers=2, target_rate=1 / 64)
     return {
-        # ---- smoke scale (~20M params, minutes) ----
+        # ---- smoke scale (minutes per run) ----
+        # base ~14M + cores ~2x21M -> ~57M params, ~62% in cores;
+        # FLOPs/token ~= a ~19M dense model + attention terms
         "smoke_cores": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
-            max_seq_len=T, core_layer=4, cores=[hefty]),
+            max_seq_len=T, core_layer=4, cores=[hefty, hefty]),
         "smoke_cores_mem": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
-            max_seq_len=T, core_layer=4, cores=[hefty, memory]),
+            max_seq_len=T, core_layer=4, cores=[hefty, hefty, memory]),
         "smoke_dense_full": ModelConfig(   # param-matched to smoke_cores
-            vocab_size=256, d_model=448, n_layers=8, n_heads=7, window=T,
+            vocab_size=256, d_model=640, n_layers=12, n_heads=10, window=T,
             max_seq_len=T, core_layer=4, cores=[]),
         "smoke_dense_local": ModelConfig(  # FLOPs-matched to smoke_cores
-            vocab_size=256, d_model=384, n_layers=9, n_heads=6, window=256,
+            vocab_size=256, d_model=384, n_layers=11, n_heads=6, window=256,
             max_seq_len=T, core_layer=4, cores=[]),
         # ---- base scale (~180M total for cores config) ----
         "base_cores": ModelConfig(
