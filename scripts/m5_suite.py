@@ -16,6 +16,7 @@ def main():
     ap.add_argument("--seq-len", default="2048")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--compile", action="store_true")
     ap.add_argument("--presets", nargs="*", default=PRESETS)
     args = ap.parse_args()
 
@@ -28,6 +29,8 @@ def main():
             cmd.append("--wandb")
         if args.synthetic:
             cmd.append("--synthetic")
+        if args.compile:
+            cmd.append("--compile")
         print(f"SUITE_RUN {preset}", flush=True)
         rc = subprocess.call(cmd)
         if rc != 0:

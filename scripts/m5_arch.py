@@ -169,16 +169,23 @@ def main():
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--eval-batches", type=int, default=8)
     ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--compile", action="store_true")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
+    torch.set_float32_matmul_precision("high")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     T = args.seq_len
     cfg = presets(T)[args.preset]
     model = SWTransformer(cfg).to(device)
+    if args.compile:
+        try:
+            model = torch.compile(model, dynamic=True)
+        except Exception as e:
+            print(f"torch.compile unavailable ({e}); running eager", flush=True)
     fpt = flops_per_token(model, cfg, T)
     n_params = model.num_params()
     if args.tokens:
