@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ModelConfig, CoreConfig
-from .core_module import Core, MultiCore, TokenAdapter
+from .core_module import Core, MultiCore, TokenAdapter, orthonormalize_rows_
 
 # Query-block size floor for banded attention. C = `window` is the natural
 # block (key window W = 2*window-1 — the least wasted work per query); the
@@ -240,6 +240,34 @@ class SWTransformer(nn.Module):
                         auxes.append(aux)
         logits = self.head(self.ln_f(h))
         return (logits, auxes) if collect_aux else logits
+
+    @torch.no_grad()
+    def reproject_gates(self):
+        """Make every gate direction at the core layer mutually orthogonal,
+        preserving each one's norm. Call after `optimizer.step()`; no-op with
+        fewer than two gate directions.
+
+        The rows are collected ACROSS core modules, so this covers both paths:
+        a single batched `MultiCore` (its k_dir is already (M, d_model)) and
+        the heterogeneous path, where N separate `Core`s each hold a (d_model,)
+        k_dir and would otherwise be free to converge on one direction exactly
+        as the batched cores were measured doing. Rate diversity does not save
+        them — cores at different rates sharing one direction give NESTED
+        selections, one salience notion at several zooms (plan 5.9).
+
+        Not applied at construction, so a run with the mechanism switched off
+        (`m5_arch.py --no-ortho`) is bit-identical to the pre-mechanism code.
+        """
+        ks = [c.k_dir for c in self.cores if hasattr(c, "k_dir")]
+        if sum(1 if k.dim() == 1 else k.shape[0] for k in ks) < 2:
+            return
+        w = torch.cat([k.data.reshape(-1, self.cfg.d_model) for k in ks], 0)
+        orthonormalize_rows_(w)
+        off = 0
+        for k in ks:
+            n = 1 if k.dim() == 1 else k.shape[0]
+            k.data.copy_(w[off:off + n].reshape(k.shape))
+            off += n
 
     def freeze_base(self):
         for p in self.parameters():

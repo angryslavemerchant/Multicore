@@ -12,6 +12,14 @@ PK — flat (varlen) packing on IMBALANCED rows (5 / 10 / 200 admitted of
      other across the packed buffer's row boundaries.
 SW — banded base sliding-window attention == the dense (T,T) mask it replaced,
      in forward AND in gradients.
+OG — gate directions are mutually orthogonal after reprojection, each row's
+     NORM is preserved, and they stay orthogonal through a training loop.
+     Guards the measured bug: 8 gate directions collapsed to |cos| 0.999 over
+     11k joint steps, making eight cores one core replicated.
+TQ — the sort+lerp tau quantile (which, unlike torch.quantile, traces under
+     dynamo) returns bit-identical taus.
+OG-D — the aux fields the section-10 diagnostics read are the RMS of the delta
+     actually returned and the h actually passed in.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,6 +28,7 @@ import torch
 import torch.nn.functional as F
 from core import CoreConfig, ModelConfig, SWTransformer, Core, MultiCore
 from core.base_model import SWAttention, _rope_cos_sin, _rope_apply
+from core.core_module import _quantile_lerp
 from core.resident import (resident_mask_reference, compact_indices,
                            pack_indices, window_mask)
 
@@ -422,6 +431,220 @@ def test_sw_attention_equivalence():
           f"grad err {worst_g:.2e}; receptive field exactly [i-W+1, i]")
 
 
+def _abs_cos_max(k):
+    """Max pairwise ABSOLUTE cosine between the rows of k (n, d)."""
+    n = k.detach().float()
+    n = n / n.norm(dim=1, keepdim=True)
+    c = (n @ n.t()).abs()
+    c.fill_diagonal_(0.0)
+    return c.max().item()
+
+
+def test_og_orthogonal_gates():
+    """OG — the gate-direction orthogonality mechanism.
+
+    The bug it exists for was measured, not hypothesised: after 11k steps of a
+    real joint run, all eight of a MultiCore's k_dir rows had pairwise absolute
+    cosine 0.999 (min 0.999, max 1.000) with norms 24-29 — eight cores admitting
+    one token set, which is why extra cores bought no loss.
+
+    Two halves, and both matter: DIRECTIONS become orthogonal, NORMS do not
+    move. The gate is sigmoid((s - tau)/gate_temp), so ||k_dir[c]|| is that
+    core's learned gate sharpness; normalising it away would fix collapse by
+    destroying what collapsed.
+    """
+    torch.manual_seed(7)
+    M, d = 8, 64
+    cc = CoreConfig(K=8, d_core=32, n_heads=2, n_core_layers=2,
+                    target_rate=0.25)
+    mc = MultiCore(d, cc, M)
+
+    # deliberately collapsed: near-identical directions, DIFFERENT norms (so a
+    # mechanism that normalised the rows would be caught)
+    base = torch.randn(d)
+    with torch.no_grad():
+        for i in range(M):
+            mc.k_dir[i] = base * (1.0 + 0.3 * i) + 1e-3 * torch.randn(d)
+    norms0 = mc.k_dir.detach().norm(dim=1).clone()
+    before = _abs_cos_max(mc.k_dir)
+    assert before > 0.99, f"OG setup FAILED: |cos| {before} is not collapsed"
+    assert float(norms0.max() / norms0.min()) > 2.0, \
+        "OG setup FAILED: row norms are too similar to test preservation"
+
+    mc.reproject_gates()
+    after = _abs_cos_max(mc.k_dir)
+    dn = (mc.k_dir.detach().norm(dim=1) - norms0).abs().max().item()
+    assert after < 1e-4, f"OG FAILED: |cos| {after:.3e} after reprojection"
+    assert dn < 1e-5, f"OG FAILED: row norms moved by {dn:.3e}"
+    # row 0's direction is the QR anchor and must not have rotated at all
+    d0 = 1.0 - float(F.cosine_similarity(mc.k_dir[0].detach(), base, dim=0))
+    assert d0 < 1e-6, f"OG FAILED: row 0 direction moved (1-cos = {d0:.3e})"
+
+    # ---- and they STAY orthogonal under a real optimizer. Run the identical
+    # 20 steps with and without the reprojection: the ON arm must hold, and the
+    # OFF arm must drift, or the assertion is measuring nothing.
+    def train_20(reproject):
+        torch.manual_seed(7)
+        m = MultiCore(d, cc, M)
+        with torch.no_grad():
+            for i in range(M):
+                m.k_dir[i] = base * (1.0 + 0.3 * i) + 1e-3 * torch.randn(d)
+        randomize_multicore(m, scale=0.1)    # nonzero out_w -> gate gets grad
+        m.reproject_gates()                  # randomize_multicore reset k_dir
+        k_start = m.k_dir.detach().clone()
+        h = torch.randn(4, 48, d)
+        target = torch.randn(4, 48, d) * 0.5
+        # AdamW at m5's own weight decay: the parametrizations.orthogonal route
+        # goes NaN here (the decay lands on the Householder generator);
+        # reprojection does not care.
+        opt = torch.optim.AdamW(m.parameters(), lr=1e-2, weight_decay=0.1)
+        m.train()
+        worst = 0.0
+        for _ in range(20):
+            delta, _ = m(h)
+            opt.zero_grad(set_to_none=True)
+            F.mse_loss(delta, target).backward()
+            opt.step()
+            if reproject:
+                m.reproject_gates()
+            worst = max(worst, _abs_cos_max(m.k_dir))
+        return worst, (m.k_dir.detach() - k_start).abs().max().item()
+
+    worst, moved = train_20(True)
+    free, _ = train_20(False)
+    assert moved > 1e-6, \
+        f"OG vacuous: k_dir never moved over 20 steps (max {moved:.3e})"
+    assert worst < 1e-3, f"OG FAILED: |cos| reached {worst:.3e} during training"
+    assert free > 1e-3, (f"OG vacuous: unconstrained gates only reached "
+                         f"|cos| {free:.3e}, so the 1e-3 bound proves nothing")
+
+    # the heterogeneous path: N separate Cores, one (d_model,) k_dir each,
+    # orthogonalised ACROSS modules by SWTransformer.reproject_gates
+    cfg = ModelConfig(
+        vocab_size=96, d_model=64, n_layers=3, n_heads=4, window=16,
+        max_seq_len=256, core_layer=1,
+        cores=[CoreConfig(K=4, d_core=32, n_heads=2, target_rate=0.3),
+               CoreConfig(K=8, d_core=32, n_heads=2, target_rate=0.1),
+               CoreConfig(K=16, d_core=16, n_heads=2, target_rate=0.05)])
+    model = SWTransformer(cfg)
+    assert not model.batched_cores and len(model.cores) == 3
+    with torch.no_grad():
+        for i, c in enumerate(model.cores):
+            c.k_dir.copy_(base * (1.0 + 0.5 * i) + 1e-3 * torch.randn(d))
+    het = torch.stack([c.k_dir for c in model.cores])
+    hn0 = het.detach().norm(dim=1).clone()
+    assert _abs_cos_max(het) > 0.99, "OG setup FAILED: het cores not collapsed"
+    model.reproject_gates()
+    het = torch.stack([c.k_dir for c in model.cores])
+    hc = _abs_cos_max(het)
+    hdn = (het.detach().norm(dim=1) - hn0).abs().max().item()
+    assert hc < 1e-4, f"OG FAILED: heterogeneous |cos| {hc:.3e}"
+    assert hdn < 1e-5, f"OG FAILED: heterogeneous norms moved by {hdn:.3e}"
+
+    # M == 1 has nothing to orthogonalise and must not touch k_dir
+    solo = MultiCore(d, cc, 1)
+    k1 = solo.k_dir.detach().clone()
+    solo.reproject_gates()
+    assert torch.equal(solo.k_dir.detach(), k1), "OG FAILED: M=1 changed k_dir"
+
+    print(f"OG PASSED: |cos| {before:.3f} -> {after:.2e} with norms fixed to "
+          f"{dn:.1e}; 20 AdamW steps stayed under {worst:.2e} vs {free:.2e} "
+          f"unconstrained; heterogeneous 3-core path {hc:.2e} "
+          f"(norms {hdn:.1e})")
+
+
+def test_tq_quantile_tau_unchanged():
+    """TQ — the sort+lerp tau controller is BIT-identical to torch.quantile.
+
+    `torch.quantile` calls numel() on its input, which throws under dynamo's
+    symbolic shapes, so it killed `--compile` for every multi-core preset.
+    Replacing it is only safe if tau is unchanged to the last bit: tau is a
+    threshold, and a shifted threshold silently moves the admitted set.
+    """
+    torch.manual_seed(9)
+    cases = 0
+    for shape in ((1000,), (1024, 8), (7,), (4096, 3), (1, 5), (2048, 16)):
+        for rate in (1 / 8, 1 / 64, 0.3, 0.5, 0.055, 0.9, 1 / 2, 0.001):
+            for dt in (torch.float32, torch.float64):
+                x = (torch.randn(*shape) * 2.0).to(dt)
+                q = 1.0 - rate
+                want = (torch.quantile(x, q, dim=0) if x.dim() > 1
+                        else torch.quantile(x, q))
+                got = _quantile_lerp(x, q, 0)
+                assert torch.equal(want, got), (
+                    f"TQ FAILED at shape={shape} rate={rate} {dt}: "
+                    f"max diff {(want - got).abs().max():.3e}")
+                cases += 1
+
+    # and through the gates that actually set tau
+    d, M = 32, 4
+    cc = CoreConfig(K=8, d_core=16, n_heads=2, target_rate=1 / 8)
+    h = torch.randn(4, 256, d) * 1.5
+    core = Core(d, cc).train()
+    torch.nn.init.normal_(core.k_dir, std=1.0)
+    core.gate(h)
+    s = (h @ core.k_dir).detach().float().flatten()
+    assert torch.equal(core.tau, torch.quantile(s, 1 - cc.target_rate)), \
+        "TQ FAILED: Core.gate tau != torch.quantile"
+
+    mc = MultiCore(d, cc, M).train()
+    torch.nn.init.normal_(mc.k_dir, std=1.0)
+    mc.gate(h)
+    s = torch.einsum('btd,md->btm', h, mc.k_dir).detach().float().reshape(-1, M)
+    assert torch.equal(mc.tau, torch.quantile(s, 1 - cc.target_rate, dim=0)), \
+        "TQ FAILED: MultiCore.gate tau != torch.quantile"
+    print(f"TQ PASSED: sort+lerp quantile bit-identical to torch.quantile on "
+          f"{cases} cases, and tau unchanged in both gates")
+
+
+def test_og_delta_diagnostics():
+    """OG-D — the aux fields the section-10 diagnostics read.
+
+    delta_rms / h_rms / delta_group must be present on BOTH paths and must
+    actually be the RMS of the delta returned and the h passed in — a
+    diagnostic that silently reports the wrong tensor is worse than none.
+    """
+    torch.manual_seed(8)
+    d = 48
+    cc = CoreConfig(K=8, d_core=32, n_heads=2, n_core_layers=2,
+                    target_rate=0.25)
+    h = torch.randn(3, 64, d)
+
+    def rms(t):
+        return float(t.detach().float().pow(2).mean().sqrt())
+
+    core = Core(d, cc).eval()
+    torch.nn.init.normal_(core.out_proj.weight, std=0.1)
+    torch.nn.init.normal_(core.k_dir, std=1.0)
+    delta, aux = core(h)
+    assert int(aux["delta_group"]) == 1
+    assert abs(float(aux["h_rms"]) - rms(h)) < 1e-5, "OG-D FAILED: Core h_rms"
+    assert abs(float(aux["delta_rms"]) - rms(delta)) < 1e-6, \
+        "OG-D FAILED: Core delta_rms"
+    assert float(aux["delta_rms"]) > 0, "OG-D vacuous: Core delta is zero"
+
+    mc = MultiCore(d, cc, 4).eval()
+    randomize_multicore(mc, scale=0.1)
+    delta, auxes = mc(h)
+    assert len(auxes) == 4
+    for a in auxes:
+        # one summed delta shared by all M dicts, so group == M
+        assert int(a["delta_group"]) == 4, "OG-D FAILED: delta_group != M"
+        assert abs(float(a["delta_rms"]) - rms(delta)) < 1e-6, \
+            "OG-D FAILED: MultiCore delta_rms is not the SUMMED delta"
+        assert abs(float(a["h_rms"]) - rms(h)) < 1e-5, \
+            "OG-D FAILED: MultiCore h_rms"
+    assert float(auxes[0]["delta_rms"]) > 0, "OG-D vacuous: delta is zero"
+
+    # zero-init cores: the delta really is zero, and the ratio must say so
+    # rather than divide by zero
+    fresh = MultiCore(d, cc, 4).eval()
+    _, auxes0 = fresh(h)
+    assert float(auxes0[0]["delta_rms"]) == 0.0, \
+        "OG-D FAILED: zero-init MultiCore reports nonzero delta_rms"
+    print("OG-D PASSED: delta_rms/h_rms/delta_group correct on both paths")
+
+
 if __name__ == "__main__":
     test_m0_bit_identical()
     test_m1_mask_equivalence()
@@ -430,4 +653,7 @@ if __name__ == "__main__":
     test_mb_multicore_cache()
     test_pk_packed_imbalanced_rows()
     test_sw_attention_equivalence()
+    test_og_orthogonal_gates()
+    test_tq_quantile_tau_unchanged()
+    test_og_delta_diagnostics()
     print("ALL GATES PASSED")

@@ -47,13 +47,110 @@ packed tensor is (M, Npad, dc)). The math is identical to M independent
 `Core`s whose deltas SUM into h — only the batching changes. Sequential
 cores are launch-bound (8 identical cores ran at 128k tok/s vs 307k for 2),
 which is what this exists to fix.
+
+Gate-direction collapse (`orthonormalize_rows_`, `MultiCore.reproject_gates`):
+M independently-initialised `k_dir` rows do NOT stay distinct. Measured on a
+real 11k-step joint run, all eight collapsed onto one direction (pairwise
+|cos| mean 0.999, min 0.999) — eight cores admitting one token set, i.e. one
+core replicated, which is why adding cores or core params bought no loss.
+CORE_ROUTING_PLAN.md 5.9 prescribes making collapse structurally impossible
+rather than penalised; `reproject_gates()` re-orthogonalises the DIRECTIONS
+after each optimizer step and leaves each row's NORM alone (see the function
+docstring for why both halves matter).
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import CoreConfig
 from .resident import resident_mask_reference, pack_indices
+
+
+# --------------------------------------------------- gate-direction geometry
+@torch.no_grad()
+def orthonormalize_rows_(w):
+    """In place: make the rows of `w` (n, d), n <= d, mutually ORTHOGONAL,
+    preserving every row's original norm. Returns `w`.
+
+    Direction only, on purpose. The gate is hard membership `s > tau` plus a
+    soft magnitude `sigmoid((s - tau)/gate_temp)`, so ||k_dir[c]|| sets how
+    sharply core c's magnitude saturates — normalise it away and every core
+    loses its learned gate sharpness. Collapse is a statement about direction,
+    so that is all this constrains.
+
+    QR of `w.T` gives Q (d, n) with orthonormal columns, and column i is the
+    Gram-Schmidt residual of row i against rows 0..i-1: row 0 does not move at
+    all and row i moves as little as the constraint allows, which matters when
+    this runs every optimizer step against live Adam moments. LAPACK picks Q's
+    column signs by its own convention and a flipped sign would inverse the
+    gate (admitting exactly the tokens it used to reject); diag(R) carries that
+    sign, so undo it. A rank-deficient row gives diag(R) == 0 — no sign to
+    undo, and LAPACK's arbitrary completion of the basis is exactly the escape
+    from collapse we want, so 0 maps to +1.
+
+    Chosen over `torch.nn.utils.parametrizations.orthogonal`; see
+    `MultiCore.reproject_gates`.
+    """
+    n, d = w.shape
+    assert n <= d, f"need n <= d for orthogonal gate directions, got {n} > {d}"
+    nrm = w.norm(dim=1, keepdim=True)
+    q, r = torch.linalg.qr(w.detach().float().t())          # (d,n), (n,n)
+    sgn = torch.where(torch.diagonal(r) < 0, -1.0, 1.0)
+    return w.copy_((q * sgn).t().to(w.dtype) * nrm)
+
+
+def _quantile_lerp(x, q, dim=0):
+    """`torch.quantile(x, q, dim)` (default 'linear' interpolation), via sort.
+
+    BIT-identical, not merely close: quantile is *defined* as the lerp between
+    the two order statistics either side of index q*(n-1), and the arithmetic
+    here is ATen's own — rank computed in x's dtype (not double, which shifts
+    the weight by ~1e-7 and so the returned tau), then `torch.lerp`. The TQ
+    gate in tests/test_invariants.py holds it to `torch.equal`.
+
+    It exists because `torch.quantile`'s kernel calls `numel()` on its input,
+    which raises "Cannot call numel() on tensor with symbolic sizes" under
+    dynamo — so the tau controller silently killed `--compile` for every
+    multi-core preset (m5 compiles with dynamic=True on purpose: the packed
+    passer buffer's length is data-dependent, so static shapes would recompile
+    every step).
+
+    `int(x.shape[dim])` guards on the scored axis (B*T, fixed within a run) and
+    leaves the packed axis — the one that actually varies — dynamic.
+    """
+    n = int(x.shape[dim])
+    srt = x.sort(dim=dim).values
+    rank = float(torch.tensor(q, dtype=x.dtype) * (n - 1))
+    lo = math.floor(rank)
+    return torch.lerp(srt.select(dim, lo), srt.select(dim, min(lo + 1, n - 1)),
+                      rank - lo)
+
+
+def _rms(t):
+    return t.detach().float().pow(2).mean().sqrt()
+
+
+def _delta_diag(aux, h, delta, group=1):
+    """Section-10 "delta norm / residual norm" into an aux dict.
+
+    RMS of the core delta against the RMS of the residual stream it is added
+    to: near zero says the core is dead weight, comparable to the residual
+    says it is destabilising the base. Zero-init out_proj and the soft gate are
+    two factors escaping zero together, so this needs watching early.
+
+    Detached 0-dim tensors (never `.item()` — that would sync and break the
+    compiled graph); two reductions over (B,T,d), cheap enough for every step.
+    `group` is how many aux dicts share one delta (M for MultiCore, whose M
+    cores sum into a single delta) so a consumer adding up per-core
+    contributions does not count the same delta M times.
+    """
+    aux["h_rms"] = _rms(h)
+    aux["delta_rms"] = (torch.zeros((), device=h.device) if delta is None
+                        else _rms(delta))
+    aux["delta_group"] = group
+    return aux
 
 
 # ------------------------------------------------------- banded attention
@@ -225,7 +322,7 @@ class _CoreCompute(nn.Module):
         s = h @ self.k_dir
         if self.training:
             with torch.no_grad():
-                q = torch.quantile(s.detach().float().flatten(),
+                q = _quantile_lerp(s.detach().float().flatten(),
                                    1.0 - self.cfg.target_rate)
                 # exact per-batch quantile, no EMA: under joint training the
                 # score distribution drifts continuously and an EMA lags,
@@ -250,7 +347,7 @@ class Core(_CoreCompute):
         aux = {"rate": m.float().mean().detach(),
                "tau": self.tau.detach().clone(), "m": m.detach()}
         if not m.any():
-            return torch.zeros_like(h), aux
+            return torch.zeros_like(h), _delta_diag(aux, h, None)
         # ONE flat buffer of every admitted token in the batch (rows laid end
         # to end), not a (B, P) rectangle padded to the widest row.
         flat, row, valid = pack_indices(m[None])         # (1, Npad)
@@ -263,7 +360,8 @@ class Core(_CoreCompute):
         out = self.out_proj(x) * (gc * valid.to(gc.dtype))[:, :, None]
         delta = torch.zeros(B * T, d, device=h.device, dtype=out.dtype)
         delta.index_add_(0, flat[0], out[0])
-        return delta.view(B, T, d).to(h.dtype), aux
+        delta = delta.view(B, T, d).to(h.dtype)
+        return delta, _delta_diag(aux, h, delta)
 
     def forward_reference(self, h):
         """Same computation via the O(T^2) reference mask (tests only).
@@ -337,7 +435,7 @@ class TokenAdapter(_CoreCompute):
         aux = {"rate": m.float().mean().detach(),
                "tau": self.tau.detach().clone(), "m": m.detach()}
         delta = self._solo(h) * (g * m.float())[..., None]
-        return delta, aux
+        return delta, _delta_diag(aux, h, delta)
 
     def init_ring(self, B, device, dtype=torch.float32):
         return {}
@@ -449,13 +547,43 @@ class MultiCore(nn.Module):
         nn.init.zeros_(self.out_w)
         nn.init.zeros_(self.out_b)
 
+    @torch.no_grad()
+    def reproject_gates(self):
+        """Re-orthogonalise the M gate directions in place (norms preserved).
+
+        Call after `optimizer.step()`. The step's update to `k_dir` is small
+        relative to `k_dir` itself, so the projection back onto the orthogonal
+        set is also small and Adam's moments stay approximately valid — the
+        same bargain projected-gradient methods make. No-op for M == 1.
+
+        Why this and not `torch.nn.utils.parametrizations.orthogonal`, which
+        was tried first (torch 2.10, RTX 2060, the exact autocast + compile
+        setup m5 trains under):
+          1. it produces an orthoNORMAL factor — every row norm becomes 1.0
+             (measured: 19.5..33.2 -> all 1.0), destroying the per-core gate
+             sharpness this deliberately keeps;
+          2. AdamW's decoupled weight decay lands on the Householder
+             *generator* `parametrizations.k_dir.original`, not on anything
+             with a meaning, and shrinking reflectors toward zero makes
+             `householder_product` degenerate: at m5's own wd=0.1, lr=3e-4
+             the materialised matrix was NaN within 200 steps (wd=0 was fine);
+          3. under bf16 autocast the factorisation itself runs in bf16 and
+             orthogonality degrades from |cos| 4.7e-8 to 2.6e-4;
+          4. it renames the parameter to `parametrizations.k_dir.original`,
+             which breaks `core_state_dict()` interop with `Core` and every
+             checkpoint already on disk.
+        torch.compile handled it fine — it was the other four that decided it.
+        """
+        if self.M > 1:
+            orthonormalize_rows_(self.k_dir.data)
+
     # ---- gate ----
     def gate(self, h):
         """h (...,d) -> s,m,g each (...,M). Per-core exact quantile tau."""
         s = torch.einsum('...d,md->...m', h, self.k_dir)
         if self.training:
             with torch.no_grad():
-                q = torch.quantile(s.detach().float().reshape(-1, self.M),
+                q = _quantile_lerp(s.detach().float().reshape(-1, self.M),
                                    1.0 - self.cfg.target_rate, dim=0)
                 self.tau.copy_(q)
         m = s > self.tau
@@ -466,6 +594,16 @@ class MultiCore(nn.Module):
         return [{"rate": m[..., i].float().mean().detach(),
                  "tau": self.tau[i].detach().clone(), "m": m[..., i].detach()}
                 for i in range(self.M)]
+
+    def _aux_delta(self, aux, h, delta):
+        """`_delta_diag` for all M dicts off ONE pair of reductions. The M
+        cores sum into a single delta, so the value is shared (group = M)."""
+        hr = _rms(h)
+        dr = (torch.zeros((), device=h.device) if delta is None
+              else _rms(delta))
+        for a in aux:
+            a["h_rms"], a["delta_rms"], a["delta_group"] = hr, dr, self.M
+        return aux
 
     def _norm_in(self, hc):
         """hc (M,P,d) -> (M,P,dc) with per-core LN affine + in_proj."""
@@ -483,7 +621,7 @@ class MultiCore(nn.Module):
             g = torch.ones_like(g)
         aux = self._aux(m)
         if not m.any():
-            return torch.zeros_like(h), aux
+            return torch.zeros_like(h), self._aux_delta(aux, h, None)
         # one flat buffer per core: (M, Npad) into the (B*T) token axis. Npad
         # is a per-core TOTAL over the batch, not a per-row max, so the M
         # buffers are near-equal in length and cross-core padding is ~1%.
@@ -500,7 +638,8 @@ class MultiCore(nn.Module):
         out = out * (gc * valid.to(gc.dtype))[..., None]
         delta = torch.zeros(B * T, d, device=h.device, dtype=out.dtype)
         delta.index_add_(0, fl, out.reshape(-1, d))
-        return delta.view(B, T, d).to(h.dtype), aux
+        delta = delta.view(B, T, d).to(h.dtype)
+        return delta, self._aux_delta(aux, h, delta)
 
     # ---- incremental decode (loop over cores; correctness over speed) ----
     def init_ring(self, B, device, dtype=torch.float32):

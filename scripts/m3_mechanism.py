@@ -46,6 +46,12 @@ def run_stage(model, task, iters, B, lr, device, log, eval_every=500,
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
+    # keep the gate directions mutually orthogonal (plan 5.9). A no-op for the
+    # single-core M3 configs, but the mechanism belongs wherever cores train:
+    # with >= 2 cores, independent k_dir rows were measured collapsing to one
+    # direction, i.e. one core replicated.
+    raw = getattr(model, "_orig_mod", model)
+    raw.reproject_gates()
     model.train()
     t0 = time.time()
     amp = device == "cuda"
@@ -64,6 +70,7 @@ def run_stage(model, task, iters, B, lr, device, log, eval_every=500,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
+            raw.reproject_gates()
         sched.step()
         if it % eval_every == 0 or it == iters:
             metrics = eval_recall(model, task, BUCKETS, n_batches=8, B=64,

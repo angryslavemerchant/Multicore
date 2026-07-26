@@ -17,6 +17,9 @@ def main():
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--no-ortho", action="store_true",
+                    help="passed to m5_arch: disable orthogonal gate "
+                         "directions (the without arm of the ablation)")
     ap.add_argument("--data-shards", default=None,
                     help="passed to m5_arch (3.47 GB of bytes per shard)")
     ap.add_argument("--data-dir", default=None)
@@ -34,6 +37,8 @@ def main():
             cmd.append("--synthetic")
         if args.compile:
             cmd.append("--compile")
+        if args.no_ortho:
+            cmd.append("--no-ortho")
         if args.data_shards:
             cmd += ["--data-shards", str(args.data_shards)]
         if args.data_dir:
