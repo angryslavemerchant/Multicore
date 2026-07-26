@@ -2,12 +2,26 @@
 tokens.
 
 The core is an n_layer stack of (attention over residents + FFN) applied on
-the COMPACTED passer sequence, with a learned rank-relative attention bias
-(delta-rank in passer space, 0..K-1). On that compacted stream the resident
+the PACKED passer sequence, with a learned rank-relative attention bias
+(delta-rank in passer space, 0..K-1). On that packed stream the resident
 set of rank p is exactly ranks p-K+1..p, so prefill attention is BANDED and
 runs block-wise (see `_band_layout`): O(P*K), never O(P*P). The dense P x P
 mask/bias path survives only where the band does not apply -- the O(T^2)
-reference and decode's 1-query-vs-K-ring step. Two layers + rank bias let the core
+reference and decode's 1-query-vs-K-ring step.
+
+PACKED, not padded: the batch's admitted tokens go into ONE flat buffer per
+core (`resident.pack_indices`), rows laid end to end, rather than a (B, P)
+rectangle whose width is the widest row's passer count. A rectangle costs
+max-over-rows for EVERY row, and gate scores are not evenly spread over a
+batch -- measured on an imbalanced batch, P = 785 against a mean row of 128,
+i.e. 6.1x of the core's arithmetic (and memory) spent on padding that the
+mask then throws away. Packing costs sum-over-rows, which is the work
+actually needed; what is left over is the spread between the M cores'
+TOTALS, measured at 1%. The separation the rectangle got from its shape
+becomes one extra mask term: a slot may only attend slots with the same row
+id (`_banded_attend`). Rows are contiguous in the buffer, so within a row
+the packed-slot difference is still exactly the passer-rank difference the
+rel_bias indexes. Two layers + rank bias let the core
 express the induction circuit internally: layer 1 binds each admitted token
 to its rank-neighbours (e.g. a value to its adjacent key), layer 2 matches
 those bindings and retrieves. A single-layer bag-of-residents core cannot do
@@ -18,7 +32,7 @@ Commit semantics for multi-layer: resident j's layer-l state is computed AT
 j's admission over the residents present then, and never recomputed. Layer
 l+1 at a later token i attends over those committed layer-l states. In
 prefill this is just l stacked causal sliding-window attentions on the
-compacted sequence; in decode each admitted token computes its states from
+packed sequence; in decode each admitted token computes its states from
 the ring and stores them.
 
 Gating: hard membership (quantile-controller tau), soft magnitude
@@ -27,18 +41,19 @@ Output projection is zero-initialised: deltas are exactly 0 at init.
 
 `MultiCore` computes M cores that share a CoreConfig (same K, d_core,
 n_heads, n_core_layers, ffn_mult, target_rate) in one batched pass: every
-weight carries a leading core dimension and the core index is folded into
-the batch dim of the compaction / attention / scatter. The math is
-identical to M independent `Core`s whose deltas SUM into h — only the
-batching changes. Sequential cores are launch-bound (8 identical cores ran
-at 128k tok/s vs 307k for 2), which is what this exists to fix.
+weight carries a leading core dimension and the core index IS the batch dim
+of the packing / attention / scatter (one packed buffer per core, so the
+packed tensor is (M, Npad, dc)). The math is identical to M independent
+`Core`s whose deltas SUM into h — only the batching changes. Sequential
+cores are launch-bound (8 identical cores ran at 128k tok/s vs 307k for 2),
+which is what this exists to fix.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import CoreConfig
-from .resident import resident_mask_reference, compact_indices
+from .resident import resident_mask_reference, pack_indices
 
 
 # ------------------------------------------------------- banded attention
@@ -77,18 +92,22 @@ def _band_layout(P: int, K: int, device):
             (dlt >= 0) & (dlt < K), dlt.clamp(0, K - 1), dlt == 0)
 
 
-def _banded_attend(q, k, v, valid, rel_bias, K, G):
-    """Causal window-K attention on the compacted passer stream, banded.
+def _banded_attend(q, k, v, valid, row, rel_bias, K, G):
+    """Causal window-K attention on the PACKED passer stream, banded.
 
     q, k, v  (N, H, P, dh) heads-first; valid (N, P) bool marks real
-    passers; rel_bias (G, H, K) indexed by delta-rank, with N a whole
-    multiple of G and rows laid out g-major (G=1 for a single Core, G=M for
-    MultiCore where row = m*B + b). Returns (N, H, P, dh).
+    passers; row (N, P) long is the batch row each packed slot came from;
+    rel_bias (G, H, K) indexed by delta-rank, with N a whole multiple of G
+    and rows laid out g-major (N = G = 1 for a single Core, N = G = M for
+    MultiCore, one packed buffer per core). Returns (N, H, P, dh).
 
-    Semantics are bit-for-bit the same set as
-    `window_mask(P, K, valid)` + the rel_bias term: key rank j is attended
-    from query rank p iff 0 <= p-j < K and j is a real passer, and the
-    diagonal p == j is always allowed so no softmax row is empty.
+    Key slot j is attended from query slot p iff 0 <= p-j < K, j is a real
+    passer, and row[j] == row[p]; the diagonal p == j is always allowed so no
+    softmax row is empty (an all -inf row would come back NaN). Since the
+    packing lays each batch row down contiguously, p-j inside a row IS the
+    passer-rank difference, so this is exactly the per-row
+    `window_mask(P, K, valid)` + rel_bias the rectangle gave — the row
+    separation just moved from the tensor shape into the mask.
     """
     N, H, P, dh = q.shape
     nb, C, W, Pp, jc, okj, band, dlt, slf = _band_layout(P, K, q.device)
@@ -97,6 +116,7 @@ def _banded_attend(q, k, v, valid, rel_bias, K, G):
         pad = (0, 0, 0, Pp - P)
         q, k, v = F.pad(q, pad), F.pad(k, pad), F.pad(v, pad)
         valid = F.pad(valid, (0, Pp - P))
+        row = F.pad(row, (0, Pp - P), value=-1)   # matches no real row
     qb = q.reshape(N, H, nb, C, dh)
     kb = k.index_select(2, jc).view(N, H, nb, W, dh)
     vb = v.index_select(2, jc).view(N, H, nb, W, dh)
@@ -105,8 +125,10 @@ def _banded_attend(q, k, v, valid, rel_bias, K, G):
     logits = (logits.view(G, N // G, H, nb, C, W) + bias[:, None, :, None]) \
         .view(N, H, nb, C, W)
     vk = valid.index_select(1, jc).view(N, nb, W)            # key is a passer
-    ok = (band & okj[:, None, :] & vk[:, :, None, :]) | slf  # (N, nb, C, W)
-    logits.masked_fill_(~ok[:, None], float("-inf"))
+    rk = row.index_select(1, jc).view(N, nb, W)
+    same = row.reshape(N, nb, C)[:, :, :, None] == rk[:, :, None, :]
+    ok = (band & okj[:, None, :] & vk[:, :, None, :] & same) | slf
+    logits.masked_fill_(~ok[:, None], float("-inf"))         # (N, nb, C, W)
     a = torch.softmax(logits.float(), dim=-1).to(vb.dtype)
     out = torch.einsum('nhicw,nhiwd->nhicd', a, vb)
     return out.reshape(N, H, Pp, dh)[:, :, :P]
@@ -133,18 +155,19 @@ class _CoreLayer(nn.Module):
         B, P, _ = x.shape
         return x.view(B, P, self.n_heads, self.d_head).transpose(1, 2)
 
-    def attend_banded(self, x, valid):
-        """Prefill on the compacted passer stream: queries and keys are the
-        same P ranks, so the mask is exactly the K-wide causal band and we
-        never build (P, P). x (B,P,dc), valid (B,P) bool."""
+    def attend_banded(self, x, valid, row):
+        """Prefill on the PACKED passer stream: queries and keys are the same
+        P slots, so the mask is exactly the K-wide causal band (intersected
+        with same-row) and we never build (P, P). x (1,P,dc), valid (1,P)
+        bool, row (1,P) long."""
         B, P, _ = x.shape
         out = _banded_attend(self._heads(self.q(x)), self._heads(self.k(x)),
-                             self._heads(self.v(x)), valid,
+                             self._heads(self.v(x)), valid, row,
                              self.rel_bias[None], self.rel_bias.shape[1], 1)
         return out.transpose(1, 2).reshape(B, P, -1)
 
-    def forward_banded(self, x, valid):
-        return x + self.ffn(self.attend_banded(x, valid))
+    def forward_banded(self, x, valid, row):
+        return x + self.ffn(self.attend_banded(x, valid, row))
 
     def attend(self, xq, xkv, mask, dq, dkv):
         """Dense-mask attention. Only for the two paths where the band does
@@ -228,17 +251,19 @@ class Core(_CoreCompute):
                "tau": self.tau.detach().clone(), "m": m.detach()}
         if not m.any():
             return torch.zeros_like(h), aux
-        idx, valid = compact_indices(m)
-        P = idx.shape[1]
-        hc = torch.gather(h, 1, idx[:, :, None].expand(-1, -1, d))
-        gc = torch.gather(g, 1, idx)
+        # ONE flat buffer of every admitted token in the batch (rows laid end
+        # to end), not a (B, P) rectangle padded to the widest row.
+        flat, row, valid = pack_indices(m[None])         # (1, Npad)
+        hf = h.reshape(B * T, d)
+        hc = hf.index_select(0, flat[0])[None]           # (1, Npad, d)
+        gc = g.reshape(B * T).index_select(0, flat[0])[None]
         x = self.in_proj(self.ln(hc))
         for layer in self.layers:
-            x = layer.forward_banded(x, valid)
-        dc = self.out_proj(x) * (gc * valid.float())[:, :, None]
-        delta = torch.zeros_like(h)
-        delta.scatter_(1, idx[:, :, None].expand(-1, -1, d), dc)
-        return delta, aux
+            x = layer.forward_banded(x, valid, row)
+        out = self.out_proj(x) * (gc * valid.to(gc.dtype))[:, :, None]
+        delta = torch.zeros(B * T, d, device=h.device, dtype=out.dtype)
+        delta.index_add_(0, flat[0], out[0])
+        return delta.view(B, T, d).to(h.dtype), aux
 
     def forward_reference(self, h):
         """Same computation via the O(T^2) reference mask (tests only).
@@ -330,8 +355,9 @@ def _stacked(*shape, std=0.02):
 
 
 def _bl(x, w, b):
-    """Batched-over-cores linear: x (M,B,P,i) @ w (M,i,o) + b (M,o)."""
-    return torch.einsum('mbpi,mio->mbpo', x, w) + b[:, None, None, :]
+    """Batched-over-cores linear: x (M,P,i) @ w (M,i,o) + b (M,o). P is the
+    PACKED slot axis — one buffer per core, the whole batch inside it."""
+    return torch.einsum('mpi,mio->mpo', x, w) + b[:, None, :]
 
 
 class _MultiCoreLayer(nn.Module):
@@ -352,28 +378,25 @@ class _MultiCoreLayer(nn.Module):
         self.rel_bias = nn.Parameter(torch.zeros(M, cfg.n_heads, cfg.K))
 
     # ---- full-sequence (batched over cores) ----
-    def _heads(self, t, M, B, P):
-        return t.view(M, B, P, self.n_heads, self.d_head) \
-                .permute(0, 1, 3, 2, 4).reshape(M * B, self.n_heads, P, self.d_head)
+    def _heads(self, t, M, P):
+        return t.view(M, P, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
-    def attend(self, x, valid):
-        """x (M,B,P,dc); valid (M,B,P) bool. Same math as
-        _CoreLayer.attend_banded with M folded into the batch: the band is
-        walked in blocks, so nothing here is ever (P, P)."""
-        M, B, P, dc = x.shape
-        q = self._heads(_bl(x, self.q_w, self.q_b), M, B, P)
-        k = self._heads(_bl(x, self.k_w, self.k_b), M, B, P)
-        v = self._heads(_bl(x, self.v_w, self.v_b), M, B, P)
-        out = _banded_attend(q, k, v, valid.reshape(M * B, P),
-                             self.rel_bias, self.K, M)
-        return out.view(M, B, self.n_heads, P, self.d_head) \
-                  .permute(0, 1, 3, 2, 4).reshape(M, B, P, dc)
+    def attend(self, x, valid, row):
+        """x (M,P,dc); valid (M,P) bool; row (M,P) long. Same math as
+        _CoreLayer.attend_banded with the core index in the batch slot: the
+        band is walked in blocks, so nothing here is ever (P, P)."""
+        M, P, dc = x.shape
+        q = self._heads(_bl(x, self.q_w, self.q_b), M, P)
+        k = self._heads(_bl(x, self.k_w, self.k_b), M, P)
+        v = self._heads(_bl(x, self.v_w, self.v_b), M, P)
+        out = _banded_attend(q, k, v, valid, row, self.rel_bias, self.K, M)
+        return out.permute(0, 2, 1, 3).reshape(M, P, dc)
 
     def ffn(self, a):
         return _bl(F.gelu(_bl(a, self.f1_w, self.f1_b)), self.f2_w, self.f2_b)
 
-    def forward(self, x, valid):
-        return x + self.ffn(self.attend(x, valid))
+    def forward(self, x, valid, row):
+        return x + self.ffn(self.attend(x, valid, row))
 
     # ---- single-core slice (decode path) ----
     def attend_one(self, mi, xq, xkv, mask, dq, dkv):
@@ -445,9 +468,9 @@ class MultiCore(nn.Module):
                 for i in range(self.M)]
 
     def _norm_in(self, hc):
-        """hc (M,B,P,d) -> (M,B,P,dc) with per-core LN affine + in_proj."""
+        """hc (M,P,d) -> (M,P,dc) with per-core LN affine + in_proj."""
         x = F.layer_norm(hc, (self.d_model,))
-        x = x * self.ln_w[:, None, None, :] + self.ln_b[:, None, None, :]
+        x = x * self.ln_w[:, None, :] + self.ln_b[:, None, :]
         return _bl(x, self.in_w, self.in_b)
 
     def forward(self, h, m_override=None):
@@ -461,22 +484,22 @@ class MultiCore(nn.Module):
         aux = self._aux(m)
         if not m.any():
             return torch.zeros_like(h), aux
-        # (M,B,T) -> rows r = m*B + b, so every (core, batch-row) is a row
-        mp = m.permute(2, 0, 1).reshape(M * B, T)
-        idx, valid = compact_indices(mp)            # (M*B,P)
-        P = idx.shape[1]
-        row_b = torch.arange(M * B, device=h.device) % B
-        flat = row_b[:, None] * T + idx             # into h.view(B*T, d)
-        hc = h.reshape(B * T, d).index_select(0, flat.reshape(-1)).view(M, B, P, d)
-        gc = g.permute(2, 0, 1).reshape(M * B, T).gather(1, idx).view(M, B, P)
+        # one flat buffer per core: (M, Npad) into the (B*T) token axis. Npad
+        # is a per-core TOTAL over the batch, not a per-row max, so the M
+        # buffers are near-equal in length and cross-core padding is ~1%.
+        mp = m.permute(2, 0, 1)                     # (M,B,T)
+        flat, row, valid = pack_indices(mp)         # (M,Npad)
+        fl = flat.reshape(-1)
+        P = flat.shape[1]
+        hc = h.reshape(B * T, d).index_select(0, fl).view(M, P, d)
+        gc = g.permute(2, 0, 1).reshape(M, B * T).gather(1, flat)
         x = self._norm_in(hc)
-        vm = valid.view(M, B, P)
         for layer in self.layers:
-            x = layer(x, vm)
+            x = layer(x, valid, row)
         out = _bl(x, self.out_w, self.out_b)
-        out = out * (gc * vm.to(gc.dtype))[..., None]
+        out = out * (gc * valid.to(gc.dtype))[..., None]
         delta = torch.zeros(B * T, d, device=h.device, dtype=out.dtype)
-        delta.index_add_(0, flat.reshape(-1), out.reshape(-1, d))
+        delta.index_add_(0, fl, out.reshape(-1, d))
         return delta.view(B, T, d).to(h.dtype), aux
 
     # ---- incremental decode (loop over cores; correctness over speed) ----

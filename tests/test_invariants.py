@@ -7,6 +7,9 @@ M2 — full prefill logits match token-by-token incremental decode (the cache
      broken).
 MB — MultiCore (M cores batched into one pass) == M independent Cores summed,
      and its own prefill/decode cache test.
+PK — flat (varlen) packing on IMBALANCED rows (5 / 10 / 200 admitted of
+     T=256) still equals the O(T^2) reference, and rows do not leak into each
+     other across the packed buffer's row boundaries.
 SW — banded base sliding-window attention == the dense (T,T) mask it replaced,
      in forward AND in gradients.
 """
@@ -17,7 +20,8 @@ import torch
 import torch.nn.functional as F
 from core import CoreConfig, ModelConfig, SWTransformer, Core, MultiCore
 from core.base_model import SWAttention, _rope_cos_sin, _rope_apply
-from core.resident import resident_mask_reference, compact_indices, window_mask
+from core.resident import (resident_mask_reference, compact_indices,
+                           pack_indices, window_mask)
 
 torch.manual_seed(0)
 
@@ -200,6 +204,122 @@ def test_mb_multicore_cache():
           f"(err {err:.2e}, ring counts up to {int(counts.max())} > K={cc.K})")
 
 
+def test_pk_packed_imbalanced_rows():
+    """PK — the case flat packing exists for.
+
+    Rows admitting 5 / 10 / 200 of T=256: the old rectangle padded all three
+    out to 200 wide (600 slots for 215 tokens) and let the mask throw the
+    padding away. The packed buffer is 215 long and carries a row id instead.
+    Ground truth is the untouched O(T^2) `forward_reference`.
+    """
+    torch.manual_seed(6)
+    B, T, d = 3, 256, 32
+    counts = [5, 10, 200]
+    cc = CoreConfig(K=8, d_core=32, n_heads=2, n_core_layers=2)
+
+    core = Core(d, cc).eval()
+    torch.nn.init.normal_(core.out_proj.weight, std=0.1)
+    torch.nn.init.normal_(core.out_proj.bias, std=0.1)
+    for lay in core.layers:
+        torch.nn.init.normal_(lay.rel_bias, std=0.5)
+    core.k_dir.data.zero_()
+    core.k_dir.data[0] = 1.0                 # gate reads channel 0
+    core.tau.data.fill_(0.0)                 # admitted iff h[..., 0] > 0
+
+    h = torch.randn(B, T, d)
+    h[..., 0] = -1.0
+    for b, c in enumerate(counts):
+        h[b, torch.randperm(T)[:c], 0] = 1.0
+
+    with torch.no_grad():
+        fast, aux = core(h)
+        ref, _ = core.forward_reference(h)
+    m = aux["m"]
+    assert m.sum(1).tolist() == counts, \
+        f"PK setup FAILED: admitted {m.sum(1).tolist()} != {counts}"
+    assert ref.abs().max() > 1e-3, "PK vacuous: reference delta is ~zero"
+    err = (fast - ref).abs().max().item()
+    assert torch.allclose(fast, ref, atol=1e-5), \
+        f"PK FAILED: packed vs O(T^2) reference, max err {err}"
+
+    # the packing itself: one buffer of exactly sum(counts), rows contiguous
+    # and in (b, then t) order, every admitted token present exactly once
+    flat, row, valid = pack_indices(m[None])
+    assert flat.shape == (1, sum(counts)) and bool(valid.all()), \
+        f"PK FAILED: buffer is {tuple(flat.shape)}, want (1, {sum(counts)})"
+    assert torch.equal(row[0], torch.repeat_interleave(
+        torch.arange(B), torch.tensor(counts))), "PK FAILED: rows not in order"
+    for b in range(B):
+        tb = flat[0][row[0] == b] % T
+        assert torch.equal(tb, m[b].nonzero().flatten()), \
+            f"PK FAILED: row {b} slots are not its passers in order"
+
+    # row separation. Row 1's first passer sits at buffer slot 5, so with K=8
+    # it looks back over slots 0..4 -- all of row 0. Only the row-id mask
+    # stops that, and a leak would show up as a gradient into row 0.
+    hg = h.clone().requires_grad_(True)
+    t1 = int(m[1].nonzero()[0])
+    core(hg)[0][1, t1].sum().backward()
+    reach = (hg.grad.abs().sum(-1) > 0).nonzero().tolist()
+    assert reach == [[1, t1]], \
+        f"PK FAILED: delta[1, {t1}] reaches {reach}, want only [[1, {t1}]]"
+
+    # the batched path, with a DIFFERENT imbalance per core so the two packed
+    # buffers have different lengths (215 vs 243 -> real cross-core padding)
+    mc = MultiCore(d, cc, 2).eval()
+    randomize_multicore(mc, scale=0.1)
+    for lay in mc.layers:
+        torch.nn.init.normal_(lay.rel_bias, std=0.5)
+    torch.nn.init.normal_(mc.ln_w, mean=1.0, std=0.1)
+    torch.nn.init.normal_(mc.ln_b, std=0.1)
+    mc.k_dir.data.zero_()
+    mc.k_dir.data[0, 0] = 1.0                # core 0 gates on channel 0
+    mc.k_dir.data[1, 1] = 1.0                # core 1 gates on channel 1
+    mc.tau.data.zero_()
+    counts2 = [200, 3, 40]
+    h2 = h.clone()
+    h2[..., 1] = -1.0
+    for b, c in enumerate(counts2):
+        h2[b, torch.randperm(T)[:c], 1] = 1.0
+
+    with torch.no_grad():
+        got, auxes = mc(h2)
+        want = torch.zeros_like(h2)
+        for i in range(2):
+            c = Core(d, cc).eval()
+            c.load_state_dict(mc.core_state_dict(i))
+            want = want + c.forward_reference(h2)[0]
+    tot = [int(a["m"].sum()) for a in auxes]
+    assert tot == [sum(counts), sum(counts2)], \
+        f"PK setup FAILED: core totals {tot}"
+    assert got.abs().max() > 1e-3, "PK vacuous: MultiCore delta is ~zero"
+    err2 = (got - want).abs().max().item()
+    assert torch.allclose(got, want, atol=1e-5), \
+        f"PK FAILED: packed MultiCore vs O(T^2) reference, max err {err2}"
+
+    # pack_indices on random masks, incl. empty rows and empty cores
+    for G, Bg, Tg, p in ((1, 4, 37, 0.3), (3, 5, 64, 0.05), (2, 3, 16, 0.9)):
+        mm = torch.rand(G, Bg, Tg) < p
+        mm[0, 0] = False                                    # an empty row
+        if G > 1:
+            mm[-1] = False                                  # an empty core
+        fl, rw, vd = pack_indices(mm)
+        cnt = mm.reshape(G, -1).sum(1)
+        assert fl.shape[1] == max(int(cnt.max()), 1), \
+            f"PK FAILED: Npad {fl.shape[1]} != max core total {int(cnt.max())}"
+        for gi in range(G):
+            wnt = mm[gi].reshape(-1).nonzero().flatten()    # (b, t) order
+            assert torch.equal(fl[gi][vd[gi]], wnt) and \
+                torch.equal(rw[gi][vd[gi]], wnt // Tg) and \
+                int(vd[gi].sum()) == int(cnt[gi]), \
+                f"PK FAILED: pack_indices wrong for G={G} p={p} core {gi}"
+
+    print(f"PK PASSED: packed rows {counts} == O(T^2) reference "
+          f"(err {err:.2e}); MultiCore totals {tot} (err {err2:.2e}); "
+          f"buffer {sum(counts)} slots vs rectangle {B * max(counts)}; "
+          f"no cross-row leak")
+
+
 def _sw_forward_dense(attn, x):
     """Reference SWAttention.forward: build the dense (T,T) bool mask and let
     scaled_dot_product_attention do it. This is verbatim the O(T^2) code the
@@ -308,5 +428,6 @@ if __name__ == "__main__":
     test_m2_cache_correctness()
     test_mb_multicore_equivalence()
     test_mb_multicore_cache()
+    test_pk_packed_imbalanced_rows()
     test_sw_attention_equivalence()
     print("ALL GATES PASSED")
