@@ -1,0 +1,6 @@
+{
+  "_comment": "Boot gate for REAL training runs on big cards (M5 architecture runs). Measured bf16 on healthy RTX PRO 6000 Blackwell hosts: 302-410 TFLOPS. One rented host measured 93.1 (shared/throttled/partitioned GPU) and would have run an M5 config at ~1/3 speed for full price -- the cheap gate (floor 5) let it through. Floor of 200 rejects that class while leaving headroom for Max-Q variants. Disk floor is raised too: M5 streams a dataset and writes checkpoints. Select via: launch.py launch --thresholds vast/thresholds_blackwell.json",
+  "disk_write_mbps": 200,
+  "pcie_h2d_gbps": 5,
+  "gpu_bf16_tflops": 200
+}
