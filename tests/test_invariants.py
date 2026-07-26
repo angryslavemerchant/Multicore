@@ -5,12 +5,14 @@ M1 — gather->window->scatter agrees with the O(T^2) reference mask spec.
 M2 — full prefill logits match token-by-token incremental decode (the cache
      test: if this fails, an invariant in CORE_ROUTING_PLAN.md section 6 is
      broken).
+MB — MultiCore (M cores batched into one pass) == M independent Cores summed,
+     and its own prefill/decode cache test.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from core import CoreConfig, ModelConfig, SWTransformer, Core
+from core import CoreConfig, ModelConfig, SWTransformer, Core, MultiCore
 from core.resident import resident_mask_reference, compact_indices, window_mask
 
 torch.manual_seed(0)
@@ -27,10 +29,19 @@ def small_cfg(n_cores=2, adapter=False):
 def randomize_core_outputs(model, scale=0.1):
     """Make deltas nonzero so M1/M2 actually test the core path."""
     for c in model.cores:
+        if isinstance(c, MultiCore):
+            randomize_multicore(c, scale)
+            continue
         torch.nn.init.normal_(c.out_proj.weight, std=scale)
         torch.nn.init.normal_(c.out_proj.bias, std=scale)
         # push gate scores around so a healthy fraction of tokens are admitted
         torch.nn.init.normal_(c.k_dir, std=1.0)
+
+
+def randomize_multicore(mc, scale=0.1):
+    torch.nn.init.normal_(mc.out_w, std=scale)
+    torch.nn.init.normal_(mc.out_b, std=scale)
+    torch.nn.init.normal_(mc.k_dir, std=1.0)
 
 
 def test_m0_bit_identical():
@@ -100,8 +111,95 @@ def test_m2_cache_correctness():
     print("M2 PASSED: prefill == incremental decode, cores turning over")
 
 
+def test_mb_multicore_equivalence():
+    """MultiCore(M=3) == three independent Cores whose deltas are summed."""
+    torch.manual_seed(3)
+    M, d = 3, 48
+    cc = CoreConfig(K=8, d_core=32, n_heads=2, n_core_layers=2,
+                    target_rate=0.2)
+    mc = MultiCore(d, cc, M).eval()
+    randomize_multicore(mc, scale=0.1)
+    for lay in mc.layers:                      # rank bias starts at zero
+        torch.nn.init.normal_(lay.rel_bias, std=0.5)
+    torch.nn.init.normal_(mc.ln_w, mean=1.0, std=0.1)
+    torch.nn.init.normal_(mc.ln_b, std=0.1)
+
+    h = torch.randn(4, 64, d)
+    # eval mode -> tau is static; set it to the per-core (1-rate) quantile so
+    # each core admits a realistic (and different) slice of tokens. Take the
+    # midpoint between the two neighbouring order statistics: a tau that sits
+    # exactly ON a score would make membership hinge on the last bit of the
+    # score (batched einsum vs h @ k_dir differ there), which is a float tie,
+    # not a semantic difference.
+    s = torch.einsum('btd,md->btm', h, mc.k_dir)
+    n = s[..., 0].numel()
+    k = int(n * (1 - cc.target_rate))
+    for i in range(M):
+        srt = s[..., i].flatten().sort().values
+        mc.tau[i] = 0.5 * (srt[k - 1] + srt[k])
+    assert torch.isfinite(mc.tau).all()
+
+    cores = []
+    for i in range(M):
+        c = Core(d, cc).eval()
+        c.load_state_dict(mc.core_state_dict(i))
+        cores.append(c)
+
+    with torch.no_grad():
+        delta, auxes = mc(h)
+        ref = torch.zeros_like(h)
+        ref_aux = []
+        for c in cores:
+            dl, a = c(h)                       # all cores see the SAME h
+            ref = ref + dl
+            ref_aux.append(a)
+    assert delta.abs().max() > 1e-3, "MB vacuous: MultiCore delta is ~zero"
+    err = (delta - ref).abs().max().item()
+    assert torch.allclose(delta, ref, atol=1e-4), \
+        f"MB FAILED: batched vs per-core delta max err {err}"
+    for i in range(M):
+        assert torch.allclose(auxes[i]["rate"], ref_aux[i]["rate"]), \
+            f"MB FAILED: core {i} aux rate mismatch"
+        assert torch.equal(auxes[i]["m"], ref_aux[i]["m"])
+    rates = [float(a["rate"]) for a in auxes]
+    print(f"MB PASSED: MultiCore == {M} summed Cores "
+          f"(max err {err:.2e}, rates {[round(r, 3) for r in rates]})")
+
+
+def test_mb_multicore_cache():
+    """M2 for the batched path: identical core configs -> MultiCore."""
+    torch.manual_seed(4)
+    cc = CoreConfig(K=4, d_core=32, n_heads=2, n_core_layers=2,
+                    target_rate=0.3)
+    cfg = ModelConfig(vocab_size=96, d_model=64, n_layers=3, n_heads=4,
+                      window=16, max_seq_len=256, core_layer=1,
+                      cores=[cc, CoreConfig(K=4, d_core=32, n_heads=2,
+                                            target_rate=0.3)])
+    model = SWTransformer(cfg).eval()
+    assert model.batched_cores and isinstance(model.cores[0], MultiCore), \
+        "MB FAILED: identical core configs did not take the MultiCore path"
+    randomize_core_outputs(model)
+    B, T = 3, 200
+    idx = torch.randint(0, 96, (B, T))
+    with torch.no_grad():
+        full_logits, auxes = model(idx, collect_aux=True)
+        caches = model.init_caches(B, idx.device)
+        steps = [model.forward_step(idx[:, t], caches) for t in range(T)]
+    inc_logits = torch.stack(steps, dim=1)
+    err = (full_logits - inc_logits).abs().max().item()
+    assert err < 1e-4, f"MB cache FAILED: max logit err {err}"
+    assert len(auxes) == 2, f"MB FAILED: expected 2 auxes, got {len(auxes)}"
+    counts = caches["rings"][0]["count"]        # (M, B)
+    assert int(counts.max()) > cc.K, \
+        f"MB cache vacuous: rings never filled (counts={counts.tolist()})"
+    print(f"MB PASSED: MultiCore prefill == incremental decode "
+          f"(err {err:.2e}, ring counts up to {int(counts.max())} > K={cc.K})")
+
+
 if __name__ == "__main__":
     test_m0_bit_identical()
     test_m1_mask_equivalence()
     test_m2_cache_correctness()
+    test_mb_multicore_equivalence()
+    test_mb_multicore_cache()
     print("ALL GATES PASSED")

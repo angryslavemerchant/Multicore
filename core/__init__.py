@@ -1,5 +1,5 @@
 from .config import CoreConfig, ModelConfig
-from .core_module import Core, TokenAdapter
+from .core_module import Core, MultiCore, TokenAdapter
 from .base_model import SWTransformer
 from .mqar import MQAR, eval_recall, DEFAULT_BUCKETS
 from .resident import resident_mask_reference, compact_indices

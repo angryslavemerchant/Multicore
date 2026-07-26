@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ModelConfig, CoreConfig
-from .core_module import Core, TokenAdapter
+from .core_module import Core, MultiCore, TokenAdapter
 
 
 def _rope_cos_sin(d_head, positions):
@@ -105,13 +105,22 @@ class SWTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         cls = TokenAdapter if cfg.adapter else Core
-        self.cores = nn.ModuleList(cls(cfg.d_model, c) for c in cfg.cores)
+        # Identical core configs (the common case: N copies of one CoreConfig)
+        # are computed by a single batched MultiCore instead of N sequential
+        # modules — same math, one set of kernel launches. Heterogeneous
+        # configs keep the per-core path.
+        self.batched_cores = (not cfg.adapter and len(cfg.cores) > 1
+                              and all(c == cfg.cores[0] for c in cfg.cores))
+        if self.batched_cores:
+            self.cores = nn.ModuleList(
+                [MultiCore(cfg.d_model, cfg.cores[0], len(cfg.cores))])
+        else:
+            self.cores = nn.ModuleList(cls(cfg.d_model, c) for c in cfg.cores)
         self.cores_enabled = True
         self.apply(self._init)
         # re-zero core outputs (self.apply above overwrote them)
         for c in self.cores:
-            nn.init.zeros_(c.out_proj.weight)
-            nn.init.zeros_(c.out_proj.bias)
+            c.zero_out_()
 
     @staticmethod
     def _init(m):
@@ -136,7 +145,12 @@ class SWTransformer(nn.Module):
                 for core in self.cores:
                     delta, aux = core(h, m_override=gate_override)
                     h = h + delta
-                    auxes.append(aux)
+                    # MultiCore returns one aux dict per core it batches, so
+                    # the aux list keeps the same shape either way
+                    if isinstance(aux, list):
+                        auxes.extend(aux)
+                    else:
+                        auxes.append(aux)
         logits = self.head(self.ln_f(h))
         return (logits, auxes) if collect_aux else logits
 
