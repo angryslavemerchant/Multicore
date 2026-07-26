@@ -672,7 +672,7 @@ def main():
         sp.add_argument("--max-dph", type=float, default=None, dest="max_dph",
                         help="override the profile's price cap")
         sp.add_argument("--inet",    type=int,   default=500)
-        sp.add_argument("--branch",  type=str,   default="master")
+        sp.add_argument("--branch",  type=str,   default="main")
 
     sp = sub.add_parser("search");  common(sp); sp.set_defaults(fn=cmd_search)
 
