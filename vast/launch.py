@@ -688,7 +688,7 @@ def main():
                          "vast/thresholds_hf_light.json for HF-only "
                          "percept jobs with no Drive-bank dependency")
     sp.add_argument("--train-script", type=str, dest="train_script",
-                    default="scripts/m2_train.py",
+                    default="scripts/m3_mechanism.py",
                     help="Training entry point, repo-root relative "
                          "(e.g. scripts/m1_position.py)")
     sp.add_argument("--keep-alive", action="store_true", dest="keep_alive")
