@@ -58,6 +58,21 @@ def presets(T):
         "smoke_cores_8x": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
             max_seq_len=T, core_layer=4, cores=[octo] * 8),
+        # ---- rate sweep: SAME conditional FLOPs (rate x core params fixed),
+        # trading sparsity against how much data each core param sees.
+        # rate 1/8 => a core param gets gradient from 12.5% of tokens; at a
+        # 1.5B-token budget that is ~4 tokens/param (starved). Higher rate,
+        # smaller cores => same compute, far more signal per param.
+        "smoke_rate_half": ModelConfig(     # rate 1/2, small cores
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4,
+            cores=[CoreConfig(K=64, d_core=512, n_heads=8, ffn_mult=4,
+                              n_core_layers=2, target_rate=1 / 2)] * 2),
+        "smoke_rate_quarter": ModelConfig(  # rate 1/4, mid cores
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4,
+            cores=[CoreConfig(K=64, d_core=736, n_heads=8, ffn_mult=4,
+                              n_core_layers=2, target_rate=1 / 4)] * 2),
         "smoke_cores_mem": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
             max_seq_len=T, core_layer=4, cores=[hefty, hefty, memory]),
