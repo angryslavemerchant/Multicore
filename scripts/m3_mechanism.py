@@ -21,17 +21,18 @@ from core import CoreConfig, ModelConfig, SWTransformer, MQAR, eval_recall
 BUCKETS = ((0, 64), (64, 128), (128, 256), (256, 10 ** 9))
 
 
-def make_task():
-    return MQAR(T=512, n_pairs=8, n_queries=4, n_filler=64, n_keys=64, n_vals=64)
+def make_task(constant_filler=False):
+    return MQAR(T=512, n_pairs=8, n_queries=4, n_filler=64, n_keys=64,
+                n_vals=64, constant_filler=constant_filler)
 
 
-def make_cfg(task, variant):
+def make_cfg(task, variant, rope=True):
     cores = [] if variant == "none" else [CoreConfig(
         K=32, d_core=128, n_heads=4, target_rate=0.055)]
     return ModelConfig(
         vocab_size=task.vocab_size, d_model=256, n_layers=4, n_heads=4,
         window=64, max_seq_len=task.T, core_layer=2, cores=cores,
-        adapter=(variant == "adapter"))
+        adapter=(variant == "adapter"), rope=rope)
 
 
 def make_oracle_fn(task):
@@ -47,11 +48,13 @@ def run_stage(model, task, iters, B, lr, device, log, eval_every=500,
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
     model.train()
     t0 = time.time()
+    amp = device == "cuda"
     for it in range(1, iters + 1):
         idx, labels, _ = task.gen_batch(B, device=device)
         ov = oracle_fn(idx) if oracle_fn else None
-        logits, auxes = model(idx, collect_aux=True, gate_override=ov)
-        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]),
+        with torch.autocast(device, dtype=torch.bfloat16, enabled=amp):
+            logits, auxes = model(idx, collect_aux=True, gate_override=ov)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]).float(),
                                labels.view(-1), ignore_index=-100)
         # rate is held by the tau quantile controller, not a loss.
         # with a frozen base and zero admissions there is no grad path at all;
@@ -80,13 +83,17 @@ def run_stage(model, task, iters, B, lr, device, log, eval_every=500,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["pretrain", "core", "all"], default="all")
+    ap.add_argument("--stage", choices=["pretrain", "core", "all", "ladder"],
+                    default="all")
     ap.add_argument("--variant", choices=["core", "adapter", "none", "oracle"],
                     default="core")
-    ap.add_argument("--pretrain-iters", type=int, default=3000)
+    ap.add_argument("--pretrain-iters", type=int, default=6000)
     ap.add_argument("--iters", type=int, default=4000)
-    ap.add_argument("--batch", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--constant-filler", action="store_true")
+    ap.add_argument("--no-rope", action="store_true")
     ap.add_argument("--core-lr", type=float, default=1e-3)
     ap.add_argument("--base-ckpt", default="runs/m3_base/base.pt")
     ap.add_argument("--run-name", default=None)
@@ -100,7 +107,19 @@ def main():
 
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    task = make_task()
+    task = make_task(args.constant_filler)
+    rope = not args.no_rope
+
+    def build(variant):
+        model = SWTransformer(make_cfg(task, variant, rope)).to(device)
+        if args.compile:
+            try:
+                model = torch.compile(model, dynamic=True)
+            except Exception as e:  # e.g. no triton on this platform
+                print(f"torch.compile unavailable ({e}); running eager",
+                      flush=True)
+        return model
+
     run_name = args.run_name or f"m3_{args.variant}_s{args.seed}"
     run_dir = os.path.join("runs", run_name)
     os.makedirs(run_dir, exist_ok=True)
@@ -118,42 +137,56 @@ def main():
         if wb:
             wb.log(metrics)
 
-    # ---- stage: pretrain ----
-    if args.stage in ("pretrain", "all"):
-        cfg = make_cfg(task, "none")
-        model = SWTransformer(cfg).to(device)
-        print(f"pretrain: {model.num_params()/1e6:.2f}M params on {device}",
-              flush=True)
+    def do_pretrain():
+        model = build("none")
+        print(f"pretrain: rope={rope} constant_filler={args.constant_filler} "
+              f"on {device}", flush=True)
         run_stage(model, task, args.pretrain_iters, args.batch, args.lr,
                   device, log, run_dir=run_dir, tag="pre_")
         os.makedirs(os.path.dirname(args.base_ckpt), exist_ok=True)
-        torch.save(model.state_dict(), args.base_ckpt)
+        sd = getattr(model, "_orig_mod", model).state_dict()
+        torch.save(sd, args.base_ckpt)
         print(f"base saved to {args.base_ckpt}", flush=True)
 
-    # ---- stage: core ----
-    final = {}
-    if args.stage in ("core", "all"):
-        cfg = make_cfg(task, args.variant)
-        model = SWTransformer(cfg).to(device)
+    def do_variant(variant, joint=False, tag=None):
+        model = build(variant)
+        raw = getattr(model, "_orig_mod", model)
         base_sd = torch.load(args.base_ckpt, map_location=device)
-        missing, unexpected = model.load_state_dict(base_sd, strict=False)
+        missing, unexpected = raw.load_state_dict(base_sd, strict=False)
         assert not unexpected, f"ckpt keys not in model: {unexpected[:5]}"
-        if not args.joint:
-            model.freeze_base()
-        n_train = model.num_params(trainable_only=True)
-        print(f"{args.variant}: {n_train/1e6:.3f}M trainable "
-              f"({model.num_params()/1e6:.2f}M total)", flush=True)
-        oracle_fn = make_oracle_fn(task) if args.variant == "oracle" else None
-        if args.variant == "none":
+        if not joint:
+            raw.freeze_base()
+        n_train = raw.num_params(trainable_only=True)
+        name = tag or (("joint_" if joint else "") + variant)
+        print(f"{name}: {n_train/1e6:.3f}M trainable "
+              f"({raw.num_params()/1e6:.2f}M total)", flush=True)
+        oracle_fn = make_oracle_fn(task) if variant == "oracle" else None
+        if variant == "none":
             final = eval_recall(model, task, BUCKETS, n_batches=16, B=64,
                                 device=device)
             log(final)
         else:
             final = run_stage(model, task, args.iters, args.batch,
                               args.core_lr, device, log, run_dir=run_dir,
-                              oracle_fn=oracle_fn)
-        final["variant"] = args.variant
+                              oracle_fn=oracle_fn, tag=f"{name}_")
+        final["variant"] = name
         final["trainable_params"] = n_train
+        return final
+
+    final = {}
+    if args.stage in ("pretrain", "all", "ladder"):
+        do_pretrain()
+    if args.stage in ("core", "all"):
+        final = do_variant(args.variant, joint=args.joint)
+    elif args.stage == "ladder":
+        # the full diagnostic ladder, most-informative-first
+        final = {"ladder": [
+            do_variant("none"),
+            do_variant("oracle"),
+            do_variant("core"),
+            do_variant("adapter"),
+            do_variant("core", joint=True),
+        ]}
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:
         json.dump(final, f, indent=2)
     if wb:

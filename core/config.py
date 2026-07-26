@@ -23,3 +23,4 @@ class ModelConfig:
     core_layer: int = 2         # cores inserted after this block (0-based)
     cores: list = field(default_factory=list)   # list[CoreConfig]
     adapter: bool = False       # per-token control variant instead of cores
+    rope: bool = True           # rotary positions (False: learned absolute)

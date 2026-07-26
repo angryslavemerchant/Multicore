@@ -13,12 +13,30 @@ from .config import ModelConfig, CoreConfig
 from .core_module import Core, TokenAdapter
 
 
+def _rope_cos_sin(d_head, positions):
+    """positions: (...,) long -> cos/sin (..., d_head/2)."""
+    inv = 1.0 / (10000 ** (torch.arange(0, d_head, 2,
+                                        device=positions.device) / d_head))
+    ang = positions[..., None].float() * inv
+    return ang.cos(), ang.sin()
+
+
+def _rope_apply(x, cos, sin):
+    """x: (B, H, T, dh); cos/sin broadcastable to (T, dh/2)."""
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    out = torch.empty_like(x)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out
+
+
 class SWAttention(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.n_heads = cfg.n_heads
         self.d_head = cfg.d_model // cfg.n_heads
         self.window = cfg.window
+        self.rope = cfg.rope
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
 
@@ -29,16 +47,25 @@ class SWAttention(nn.Module):
         B, T, C = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = self._split(q, B, T), self._split(k, B, T), self._split(v, B, T)
+        if self.rope:
+            cos, sin = _rope_cos_sin(self.d_head, torch.arange(T, device=x.device))
+            q, k = _rope_apply(q, cos, sin), _rope_apply(k, cos, sin)
         i = torch.arange(T, device=x.device)
         mask = (i[:, None] >= i[None, :]) & (i[:, None] - i[None, :] < self.window)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.proj(out.transpose(1, 2).reshape(B, T, C))
 
-    def step(self, x, cache):
-        """x: (B, 1, C). cache holds up to `window` past k/v (including none)."""
+    def step(self, x, cache, t):
+        """x: (B, 1, C) at absolute position t. cache holds up to `window`
+        past ROTATED k (rope is position-absolute per entry, so cached k
+        stay valid) and raw v."""
         B, _, C = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = self._split(q, B, 1), self._split(k, B, 1), self._split(v, B, 1)
+        if self.rope:
+            cos, sin = _rope_cos_sin(
+                self.d_head, torch.tensor(t, device=x.device))
+            q, k = _rope_apply(q, cos, sin), _rope_apply(k, cos, sin)
         if cache["k"] is not None:
             k = torch.cat([cache["k"], k], dim=2)
             v = torch.cat([cache["v"], v], dim=2)
@@ -62,8 +89,8 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x))
         return x + self.mlp(self.ln2(x))
 
-    def step(self, x, cache):
-        x = x + self.attn.step(self.ln1(x), cache)
+    def step(self, x, cache, t):
+        x = x + self.attn.step(self.ln1(x), cache, t)
         return x + self.mlp(self.ln2(x))
 
 
@@ -72,7 +99,8 @@ class SWTransformer(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
+        self.pos_emb = None if cfg.rope else nn.Embedding(cfg.max_seq_len,
+                                                          cfg.d_model)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layers))
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
@@ -98,8 +126,9 @@ class SWTransformer(nn.Module):
         """idx: (B, T) -> logits (B, T, V), aux list (one dict per core).
         gate_override (B, T) bool: oracle admission for all cores."""
         B, T = idx.shape
-        pos = torch.arange(T, device=idx.device)
-        h = self.tok_emb(idx) + self.pos_emb(pos)[None]
+        h = self.tok_emb(idx)
+        if self.pos_emb is not None:
+            h = h + self.pos_emb(torch.arange(T, device=idx.device))[None]
         auxes = []
         for li, blk in enumerate(self.blocks):
             h = blk(h)
@@ -127,10 +156,13 @@ class SWTransformer(nn.Module):
     def forward_step(self, idx_t, caches):
         """idx_t: (B,) one token -> logits (B, V). Mutates caches."""
         B = idx_t.shape[0]
-        pos = torch.full((B,), caches["t"], device=idx_t.device, dtype=torch.long)
-        h = (self.tok_emb(idx_t) + self.pos_emb(pos))[:, None, :]
+        h = self.tok_emb(idx_t)[:, None, :]
+        if self.pos_emb is not None:
+            pos = torch.full((B,), caches["t"], device=idx_t.device,
+                             dtype=torch.long)
+            h = h + self.pos_emb(pos)[:, None, :]
         for li, blk in enumerate(self.blocks):
-            h = blk.step(h, caches["blocks"][li])
+            h = blk.step(h, caches["blocks"][li], caches["t"])
             if li == self.cfg.core_layer and self.cores and self.cores_enabled:
                 for core, ring in zip(self.cores, caches["rings"]):
                     h = h + core.step(h[:, 0, :], ring)[:, None, :]

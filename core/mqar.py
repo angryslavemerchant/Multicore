@@ -15,11 +15,12 @@ import torch
 
 class MQAR:
     def __init__(self, T=512, n_pairs=8, n_queries=4, n_filler=64, n_keys=64,
-                 n_vals=64, ctx_frac=0.75):
+                 n_vals=64, ctx_frac=0.75, constant_filler=False):
         self.T, self.n_pairs, self.n_queries = T, n_pairs, n_queries
         self.n_filler, self.n_keys, self.n_vals = n_filler, n_keys, n_vals
         self.ctx_end = int(T * ctx_frac)
         self.vocab_size = n_filler + n_keys + n_vals
+        self.constant_filler = constant_filler
         assert self.ctx_end >= 2 * n_pairs and T - self.ctx_end >= 2 * n_queries
 
     def key_token(self, k):
@@ -33,6 +34,66 @@ class MQAR:
     GAP_BUCKETS = ((2, 64), (64, 128), (128, 256), (256, 510))
 
     def gen_batch(self, B, device="cpu", generator=None):
+        """Vectorised generation, all tensor ops (GPU-capable). Query slots
+        that collide with a pair or another query keep their filler token and
+        are masked out of the loss (-100) — zero label noise, and the tiny
+        collision fraction is dropped rather than corrupted.
+
+        Returns idx (B,T), labels (B,T) (-100 off-query), gap_map (B,T)."""
+        T, P, Q = self.T, self.n_pairs, self.n_queries
+        g = generator
+        dv = device
+        if self.constant_filler:
+            idx = torch.zeros(B, T, dtype=torch.long, device=dv)
+        else:
+            idx = torch.randint(0, self.n_filler, (B, T), device=dv,
+                                generator=g)
+        # pairs: P distinct even slots in [0, T-128) via argsort-of-random
+        n_slots = (T - 128) // 2
+        pair_pos = torch.argsort(torch.rand(B, n_slots, device=dv,
+                                            generator=g), dim=1)[:, :P] * 2
+        keys = torch.argsort(torch.rand(B, self.n_keys, device=dv,
+                                        generator=g), dim=1)[:, :P]
+        vals = torch.randint(0, self.n_vals, (B, P), device=dv, generator=g)
+        key_tok = self.n_filler + keys
+        val_tok = self.n_filler + self.n_keys + vals
+        idx.scatter_(1, pair_pos, key_tok)
+        idx.scatter_(1, pair_pos + 1, val_tok)
+        # queries: the first Q pairs (already in random order -> distinct)
+        vpos = pair_pos[:, :Q] + 1
+        lohi = torch.tensor(self.GAP_BUCKETS, device=dv)
+        bk = torch.randint(0, len(self.GAP_BUCKETS), (B, Q), device=dv,
+                           generator=g)
+        lo, hi = lohi[bk, 0], lohi[bk, 1]
+        hi = torch.minimum(hi, T - 2 - vpos)
+        lo = torch.minimum(lo, hi - 1).clamp(min=2)
+        gap = lo + (torch.rand(B, Q, device=dv, generator=g)
+                    * (hi - lo).clamp(min=1)).long()
+        qpos = ((vpos + gap) // 2 * 2).clamp(max=T - 2)
+        # collision detection: against all pair slots and earlier queries
+        hit_pair = (qpos[:, :, None] == pair_pos[:, None, :]).any(-1)
+        earlier = torch.tril(torch.ones(Q, Q, dtype=torch.bool, device=dv), -1)
+        hit_query = ((qpos[:, :, None] == qpos[:, None, :]) &
+                     earlier[None]).any(-1)
+        ok = ~(hit_pair | hit_query) & (qpos > vpos)
+        q_key = key_tok[:, :Q]
+        q_val = val_tok[:, :Q]
+        safe_q = torch.where(ok, qpos, torch.zeros_like(qpos))
+        # only write where ok (scatter a copy of the original tokens where not)
+        orig_q = idx.gather(1, safe_q)
+        orig_q1 = idx.gather(1, safe_q + 1)
+        idx.scatter_(1, safe_q, torch.where(ok, q_key, orig_q))
+        idx.scatter_(1, safe_q + 1, torch.where(ok, q_val, orig_q1))
+        labels = torch.full((B, T), -100, dtype=torch.long, device=dv)
+        labels.scatter_(1, safe_q, torch.where(ok, q_val,
+                                               torch.full_like(q_val, -100)))
+        labels[:, 0] = -100  # slot 0 doubles as the not-ok dump position
+        gap_map = torch.full((B, T), -1, dtype=torch.long, device=dv)
+        gap_map.scatter_(1, safe_q, torch.where(ok, qpos - vpos,
+                                                torch.full_like(qpos, -1)))
+        return idx, labels, gap_map
+
+    def gen_batch_loop(self, B, device="cpu", generator=None):
         """Returns idx (B,T), labels (B,T) (-100 off-query), gap_map (B,T)
         (pair->query gap at query positions, -1 elsewhere).
 
