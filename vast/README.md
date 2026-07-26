@@ -40,6 +40,21 @@ operational history worth reading before renting anything.
   `.vast/instances.json` records. `--all-remote` is the unscoped version and
   must be asked for by name.
 
+## Multicore port notes (2026-07-26)
+
+- **The hedged race can destroy healthy instances.** The racer poller greps
+  `vastai logs` for GATE_PASSED, but on current image tags provisioning
+  output often never reaches `vastai logs` at all (see Monitoring below) —
+  so all racers "time out" and get destroyed while healthy. Until the
+  poller reads `/workspace/onstart.log` over SSH, launch with `--hedge 1`
+  and verify by SSH.
+- Two porting bugs cost three burned races: `--branch` defaulted to
+  `master` (repo uses `main`) and `REPO_DIR` was still `RatNav`. Both fixed;
+  if porting this folder again, grep for the old repo name FIRST.
+- Smoke validation 2026-07-26: full path (clone → deps → gate → train →
+  wandb upload → RUN_COMPLETE) confirmed working on a rented 4090. The
+  disk gate correctly rejected that machine (10 MB/s writes) — gates work.
+
 ## One-time setup
 
 `vast/secrets.env` (gitignored — this repo is PUBLIC) with:
