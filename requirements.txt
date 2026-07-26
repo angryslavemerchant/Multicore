@@ -3,4 +3,8 @@
 numpy
 wandb
 matplotlib
-datasets
+# data path: parquet shards pulled once from the hub and cached as local
+# bytes (scripts/m5_data.py). Replaces `datasets` streaming, which was flaky
+# mid-run; both of these used to arrive as datasets' own dependencies.
+huggingface_hub
+pyarrow

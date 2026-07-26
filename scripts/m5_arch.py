@@ -10,8 +10,12 @@ can be plotted), and STRATIFIED loss — positions whose 8-gram context
 reoccurs from > window bytes back ("induction positions", the
 recall-dependent slice where H2 predicts the cores' gain concentrates).
 
-Data: FineWeb-Edu streamed as UTF-8 bytes (no tokenizer, no disk). Use
---synthetic for a no-network smoke test.
+Data: FineWeb-Edu as UTF-8 bytes (no tokenizer), downloaded once as parquet
+shards and cached as a flat local uint8 file, then sampled deterministically
+-- every config sees the identical byte stream for a given seed, and there is
+no live hub connection to drop mid-run. See scripts/m5_data.py; build the
+cache up front with `python scripts/m5_data.py --shards 4`. Use --synthetic
+for a no-network smoke test.
 
 Usage:
   python scripts/m5_arch.py --preset smoke_cores --iters 200 --synthetic
@@ -19,10 +23,13 @@ Usage:
 """
 import argparse, json, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import torch.nn.functional as F
 from core import CoreConfig, ModelConfig, SWTransformer
+from m5_data import (DEFAULT_SHARDS, ByteData, build_byte_cache,
+                     induction_mask)
 
 # ---------------------------------------------------------------- presets
 # window=T -> full attention. Cores: hefty at moderate rate (+ small memory
@@ -92,26 +99,16 @@ def flops_per_token(model, cfg, T):
 
 
 # ---------------------------------------------------------------- data
-def induction_mask(chunk, window, n=8):
-    """chunk: (T,) uint8 tensor. True at positions whose length-n context
-    reoccurs from an earlier occurrence > window back (label positions where
-    recall beyond the base's window is what predicts the next byte)."""
-    T = chunk.shape[0]
-    mask = torch.zeros(T, dtype=torch.bool)
-    last = {}
-    b = chunk.tolist()
-    for t in range(n - 1, T):
-        key = tuple(b[t - n + 1:t + 1])
-        prev = last.get(key)
-        if prev is not None and t - prev > window:
-            mask[t] = True
-        last[key] = t
-    return mask
-
-
 def stream_batches(B, T, window, device, synthetic=False, seed=0,
-                   with_masks=False):
-    """Yields (idx (B,T+1) long, ind_mask (B,T) bool or None) forever."""
+                   with_masks=False, split="train", data=None,
+                   data_shards=DEFAULT_SHARDS, data_dir=None):
+    """Yields (idx (B,T+1) long, ind_mask (B,T) bool or None) forever.
+
+    Non-synthetic: random contiguous windows over the cached local byte file
+    (scripts/m5_data.py), drawn from a seeded numpy Generator -- so a given
+    (seed, B, T) gives every model config the identical sequence of batches.
+    split="eval" draws from the held-out tail, which training never touches.
+    """
     if synthetic:
         g = torch.Generator().manual_seed(seed)
         while True:
@@ -121,27 +118,10 @@ def stream_batches(B, T, window, device, synthetic=False, seed=0,
                      if with_masks else None)
             yield idx.to(device), masks.to(device) if masks is not None else None
         return
-    from datasets import load_dataset
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
-                      split="train", streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=1000)
-    buf = bytearray()
-    batch = []
-    for ex in ds:
-        buf.extend(ex["text"].encode("utf-8", errors="ignore"))
-        buf.append(0)  # document separator
-        while len(buf) > T + 1:
-            batch.append(torch.frombuffer(
-                bytes(buf[:T + 1]), dtype=torch.uint8).long())
-            del buf[:T + 1]
-            if len(batch) == B:
-                idx = torch.stack(batch)
-                masks = (torch.stack([induction_mask(idx[b, :-1], window)
-                                      for b in range(B)])
-                         if with_masks else None)
-                yield (idx.to(device),
-                       masks.to(device) if masks is not None else None)
-                batch = []
+    if data is None:
+        data = ByteData(build_byte_cache(data_shards, data_dir))
+    yield from data.batches(B, T, window, device, seed=seed, split=split,
+                            with_masks=with_masks)
 
 
 # ---------------------------------------------------------------- train
@@ -177,6 +157,11 @@ def main():
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--eval-batches", type=int, default=8)
     ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--data-shards", type=int, default=DEFAULT_SHARDS,
+                    help="FineWeb-Edu parquet shards to cache locally; each "
+                         "yields 3.47 GB of bytes (a run consumes ~1.5e9)")
+    ap.add_argument("--data-dir", default=None,
+                    help="where the byte cache lives (default runs/data)")
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--run-name", default=None)
@@ -187,6 +172,10 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     T = args.seq_len
+    # data first: a missing/failed cache should cost nothing (and the build is
+    # a one-off download, so it must not race the model onto the GPU)
+    data = None if args.synthetic else ByteData(
+        build_byte_cache(args.data_shards, args.data_dir))
     cfg = presets(T)[args.preset]
     model = SWTransformer(cfg).to(device)
     if args.compile:
@@ -221,13 +210,15 @@ def main():
         if wb:
             wb.log(m)
 
-    # held-out eval set: first chunks of a differently-seeded stream
+    # held-out eval set: fixed windows from the tail of the byte file, which
+    # the train split never reaches. Same bytes for every config and run.
     eval_stream = stream_batches(args.batch, T, cfg.window, device,
                                  synthetic=args.synthetic, seed=args.seed + 999,
-                                 with_masks=True)
+                                 with_masks=True, split="eval", data=data)
     eval_data = [next(eval_stream) for _ in range(args.eval_batches)]
     train_stream = stream_batches(args.batch, T, cfg.window, device,
-                                  synthetic=args.synthetic, seed=args.seed)
+                                  synthetic=args.synthetic, seed=args.seed,
+                                  split="train", data=data)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1,
                             betas=(0.9, 0.95))
