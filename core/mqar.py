@@ -28,31 +28,66 @@ class MQAR:
     def val_token(self, v):
         return self.n_filler + self.n_keys + v
 
+    # gap sampling buckets — matched to eval buckets so training signal is
+    # balanced across them instead of ~90% unlearnably-long gaps
+    GAP_BUCKETS = ((2, 64), (64, 128), (128, 256), (256, 510))
+
     def gen_batch(self, B, device="cpu", generator=None):
         """Returns idx (B,T), labels (B,T) (-100 off-query), gap_map (B,T)
-        (pair->query gap at query positions, -1 elsewhere)."""
+        (pair->query gap at query positions, -1 elsewhere).
+
+        Pairs land on random even slots; each query targets a DISTINCT pair
+        (a query occurrence is itself followed by the value, so re-querying
+        the same key would create a nearer retrieval target and corrupt the
+        gap measurement). Query positions are placed at gaps sampled
+        uniformly over buckets, so short/medium/long gaps all get coverage
+        in every batch."""
+        import random
+        rng = random.Random(int(torch.randint(0, 2 ** 31, (1,),
+                                              generator=generator)))
         T, P, Q = self.T, self.n_pairs, self.n_queries
+        assert Q <= P, "queries must use distinct pairs"
         idx = torch.randint(0, self.n_filler, (B, T), generator=generator)
         labels = torch.full((B, T), -100, dtype=torch.long)
         gap_map = torch.full((B, T), -1, dtype=torch.long)
         for b in range(B):
             keys = torch.randperm(self.n_keys, generator=generator)[:P]
             vals = torch.randint(0, self.n_vals, (P,), generator=generator)
-            slots = torch.randperm((self.ctx_end - 1) // 2,
-                                   generator=generator)[:P] * 2
+            # pairs: random even slots in [0, T-128) so long gaps stay possible
+            pair_slots = rng.sample(range(0, (T - 128) // 2), P)
+            pair_slots = [s * 2 for s in pair_slots]
+            occupied = set()
+            for s in pair_slots:
+                occupied.update((s, s + 1))
             for p in range(P):
-                s = int(slots[p])
+                s = pair_slots[p]
                 idx[b, s] = self.key_token(keys[p])
                 idx[b, s + 1] = self.val_token(vals[p])
-            qs = torch.randperm((T - self.ctx_end - 1) // 2,
-                                generator=generator)[:Q] * 2 + self.ctx_end
-            which = torch.randint(0, P, (Q,), generator=generator)
-            for qi in range(Q):
-                qpos, p = int(qs[qi]), int(which[qi])
+            # queries: distinct pairs, gap drawn from a random bucket
+            for p in rng.sample(range(P), Q):
+                vpos = pair_slots[p] + 1
+                qpos = None
+                for _ in range(20):
+                    lo, hi = self.GAP_BUCKETS[rng.randrange(len(self.GAP_BUCKETS))]
+                    hi = min(hi, T - 2 - vpos)
+                    if hi <= lo:
+                        continue
+                    cand = (vpos + rng.randint(lo, hi)) // 2 * 2
+                    if cand > vpos and cand <= T - 2 and \
+                            cand not in occupied and (cand + 1) not in occupied:
+                        qpos = cand
+                        break
+                if qpos is None:
+                    free = [s * 2 for s in range((vpos + 2) // 2 + 1, T // 2 - 1)
+                            if s * 2 not in occupied and s * 2 + 1 not in occupied]
+                    if not free:
+                        continue
+                    qpos = rng.choice(free)
+                occupied.update((qpos, qpos + 1))
                 idx[b, qpos] = self.key_token(keys[p])
                 idx[b, qpos + 1] = self.val_token(vals[p])  # teacher forcing
                 labels[b, qpos] = self.val_token(vals[p])
-                gap_map[b, qpos] = qpos - (int(slots[p]) + 1)
+                gap_map[b, qpos] = qpos - vpos
         return idx.to(device), labels.to(device), gap_map.to(device)
 
 
