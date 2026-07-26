@@ -36,7 +36,9 @@ packed sequence; in decode each admitted token computes its states from
 the ring and stores them.
 
 Gating: hard membership (quantile-controller tau), soft magnitude
-g = sigmoid((s - tau)/temp) on members (gradient path to k_dir).
+g = sigmoid((s - tau)/temp) on members (gradient path to k_dir). With
+`CoreConfig.learned_tau` the controller is replaced by gradient descent on tau
+itself and the admission rate becomes free — see `_tau_maintain_`.
 Output projection is zero-initialised: deltas are exactly 0 at init.
 
 `MultiCore` computes M cores that share a CoreConfig (same K, d_core,
@@ -126,6 +128,101 @@ def _quantile_lerp(x, q, dim=0):
     lo = math.floor(rank)
     return torch.lerp(srt.select(dim, lo), srt.select(dim, min(lo + 1, n - 1)),
                       rank - lo)
+
+
+def _register_tau(mod, shape):
+    """Give `mod` its admission threshold, one of the two ways.
+
+    Default: a BUFFER, because tau is not learned — it is a train-time
+    controller output, and it is frozen at inference (invariant I5).
+
+    `learned_tau`: an nn.PARAMETER, plus the `tau_initialized` buffer
+    `_tau_maintain_` uses to run its one-time quantile init exactly once
+    across checkpoint boundaries. Registered only in that mode, so a default
+    model's state_dict keys — and every checkpoint already on disk — are
+    unchanged.
+    """
+    if mod.cfg.learned_tau:
+        mod.tau = nn.Parameter(torch.zeros(shape))
+        mod.register_buffer("tau_initialized",
+                            torch.zeros((), dtype=torch.bool))
+        mod._tau_ready = False
+    else:
+        mod.register_buffer("tau", torch.zeros(shape))
+
+
+def _tau_maintain_(mod, sq, dim=0):
+    """Train-time maintenance of `mod.tau`, in place. `sq` is this batch's
+    scores, already detached and float, with the scored axis at `dim`.
+
+    Default (`learned_tau=False`): tau IS the exact (1 - target_rate) quantile
+    of every step's scores, so the hard admission rate equals target_rate by
+    construction — the model cannot admit more of an information-dense
+    sequence and less of a bland one, because the rate is not its to choose.
+
+    Free rate (`learned_tau=True`): the controller is OFF and tau is an
+    nn.Parameter that only the task loss moves. Gradient reaches it through the
+    soft magnitude g = sigmoid((s - tau)/gate_temp), which scales every
+    admitted token's delta — so the loss's preference over tau is literally
+    "how much should the admitted deltas count", and the admission rate follows
+    as the hard threshold s > tau slides (m itself is a step function and
+    passes no gradient). The quantile still runs ONCE, on the first training
+    forward, so the run STARTS at the configured target_rate instead of at an
+    arbitrary tau.
+
+    That one-time-ness is recorded in the `tau_initialized` BUFFER so a resumed
+    checkpoint does not re-init tau from whatever batch the resume happened to
+    land on. `_tau_ready` mirrors it in python and is checked first: reading a
+    device-side bool every forward would cost a sync — and a graph break under
+    --compile — for the whole run, to save one at the start.
+
+    MEASURED CAVEAT (smoke_cores_8x, B=2, T=512, lr 3e-4, 40 steps): a free tau
+    is an ABSOLUTE threshold on a distribution that moves. mean(s) slid by ~15
+    of its own spreads in 20 steps (the residual stream grew h_rms 0.66 -> 5.2
+    and k_dir picks up its common mode) while tau moved ~1.5e-4/step, i.e. two
+    orders of magnitude too slow to follow. Once the whole distribution is
+    below tau the rate is 0, and rate 0 means NO admitted token, hence no
+    gradient into tau (m is a step function; g only reaches the loss through
+    admitted slots) — an absorbing state the cores never come back from. Read
+    `tau_z` from the aux dict, not just the rate: it says whether a rate of 0
+    or 1 is what the model chose or where the distribution went.
+    """
+    if mod.cfg.learned_tau:
+        if mod._tau_ready:
+            return
+        if bool(mod.tau_initialized):        # resumed post-init: leave tau be
+            mod._tau_ready = True
+            return
+    with torch.no_grad():
+        # exact per-batch quantile, no EMA: under joint training the score
+        # distribution drifts continuously and an EMA lags, letting the
+        # admission rate creep above target.
+        mod.tau.copy_(_quantile_lerp(sq, 1.0 - mod.cfg.target_rate, dim=dim))
+    if mod.cfg.learned_tau:
+        mod.tau_initialized.fill_(True)
+        mod._tau_ready = True
+
+
+def _score_stats(sf, tau):
+    """Where the threshold sits IN the score distribution. sf is the scores,
+    detached and float, with the scored axis first; tau broadcasts against
+    sf's trailing shape.
+
+    tau is an absolute number and the scores are not. The projection of the
+    residual stream onto k_dir carries a token-independent common mode that
+    MOVES during training: measured over 40 joint steps of smoke_cores_8x at
+    lr 3e-4, mean(s) slid from +0.04 to -1.45 while its spread stayed ~0.09 --
+    ~15 spreads -- as h_rms grew 0.66 -> 5.2. The quantile controller absorbs
+    that by construction (it is shift- and scale-invariant); a learned tau does
+    not. So `tau_z = (tau - mean s) / std s` is the number that says whether a
+    measured rate of 0 or 1 is a preference or a threshold left behind by the
+    distribution, and it is the first thing to read on a --free-rate run.
+
+    Detached, two reductions over the score tensor per step.
+    """
+    mu, sd = sf.mean(0), sf.std(0)
+    return {"s_mean": mu, "s_std": sd,
+            "tau_z": (tau.detach() - mu) / sd.clamp_min(1e-12)}
 
 
 def _rms(t):
@@ -303,8 +400,8 @@ class _CoreCompute(nn.Module):
         # tau is a train-time quantile controller (set to the exact per-batch
         # (1-r)-quantile of scores -> hard admission rate == target_rate by
         # construction), frozen at inference (invariant I5). Not a learned
-        # parameter.
-        self.register_buffer("tau", torch.zeros(()))
+        # parameter -- unless cfg.learned_tau, which frees the rate.
+        _register_tau(self, ())
         self.ln = nn.LayerNorm(d_model)
         self.in_proj = nn.Linear(d_model, dc)
         self.layers = nn.ModuleList(_CoreLayer(cfg)
@@ -321,13 +418,7 @@ class _CoreCompute(nn.Module):
         """h: (..., d) -> s, hard membership m, soft magnitude g."""
         s = h @ self.k_dir
         if self.training:
-            with torch.no_grad():
-                q = _quantile_lerp(s.detach().float().flatten(),
-                                   1.0 - self.cfg.target_rate)
-                # exact per-batch quantile, no EMA: under joint training the
-                # score distribution drifts continuously and an EMA lags,
-                # letting the admission rate creep above target.
-                self.tau.copy_(q)
+            _tau_maintain_(self, s.detach().float().flatten())
         m = s > self.tau
         g = torch.sigmoid((s - self.tau) / self.cfg.gate_temp)
         return s, m, g
@@ -345,7 +436,8 @@ class Core(_CoreCompute):
         if m_override is not None:
             m, g = m_override, torch.ones_like(g)
         aux = {"rate": m.float().mean().detach(),
-               "tau": self.tau.detach().clone(), "m": m.detach()}
+               "tau": self.tau.detach().clone(), "m": m.detach(),
+               **_score_stats(s.detach().float().flatten(), self.tau)}
         if not m.any():
             return torch.zeros_like(h), _delta_diag(aux, h, None)
         # ONE flat buffer of every admitted token in the batch (rows laid end
@@ -433,7 +525,8 @@ class TokenAdapter(_CoreCompute):
         if m_override is not None:
             m, g = m_override, torch.ones_like(g)
         aux = {"rate": m.float().mean().detach(),
-               "tau": self.tau.detach().clone(), "m": m.detach()}
+               "tau": self.tau.detach().clone(), "m": m.detach(),
+               **_score_stats(s.detach().float().flatten(), self.tau)}
         delta = self._solo(h) * (g * m.float())[..., None]
         return delta, _delta_diag(aux, h, delta)
 
@@ -533,7 +626,7 @@ class MultiCore(nn.Module):
         self.cfg, self.d_model, self.M = cfg, d_model, M
         dc = cfg.d_core
         self.k_dir = nn.Parameter(torch.randn(M, d_model) * 0.02)
-        self.register_buffer("tau", torch.zeros(M))
+        _register_tau(self, (M,))        # buffer, or Parameter if learned_tau
         self.ln_w = nn.Parameter(torch.ones(M, d_model))
         self.ln_b = nn.Parameter(torch.zeros(M, d_model))
         self.in_w = _stacked(M, d_model, dc)
@@ -582,17 +675,16 @@ class MultiCore(nn.Module):
         """h (...,d) -> s,m,g each (...,M). Per-core exact quantile tau."""
         s = torch.einsum('...d,md->...m', h, self.k_dir)
         if self.training:
-            with torch.no_grad():
-                q = _quantile_lerp(s.detach().float().reshape(-1, self.M),
-                                   1.0 - self.cfg.target_rate, dim=0)
-                self.tau.copy_(q)
+            _tau_maintain_(self, s.detach().float().reshape(-1, self.M), dim=0)
         m = s > self.tau
         g = torch.sigmoid((s - self.tau) / self.cfg.gate_temp)
         return s, m, g
 
-    def _aux(self, m):
+    def _aux(self, m, s):
+        st = _score_stats(s.detach().float().reshape(-1, self.M), self.tau)
         return [{"rate": m[..., i].float().mean().detach(),
-                 "tau": self.tau[i].detach().clone(), "m": m[..., i].detach()}
+                 "tau": self.tau[i].detach().clone(), "m": m[..., i].detach(),
+                 **{k: v[i] for k, v in st.items()}}
                 for i in range(self.M)]
 
     def _aux_delta(self, aux, h, delta):
@@ -619,7 +711,7 @@ class MultiCore(nn.Module):
         if m_override is not None:
             m = m_override[..., None].expand(B, T, M)
             g = torch.ones_like(g)
-        aux = self._aux(m)
+        aux = self._aux(m, s)
         if not m.any():
             return torch.zeros_like(h), self._aux_delta(aux, h, None)
         # one flat buffer per core: (M, Npad) into the (B*T) token axis. Npad
@@ -696,6 +788,8 @@ class MultiCore(nn.Module):
               "in_proj.bias": self.in_b[mi].detach().clone(),
               "out_proj.weight": self.out_w[mi].detach().t().contiguous(),
               "out_proj.bias": self.out_b[mi].detach().clone()}
+        if self.cfg.learned_tau:      # the one-time-init record travels too
+            sd["tau_initialized"] = self.tau_initialized.detach().clone()
         for li, lay in enumerate(self.layers):
             p = f"layers.{li}."
             for name, w, b in (("q", lay.q_w, lay.q_b), ("k", lay.k_w, lay.k_b),

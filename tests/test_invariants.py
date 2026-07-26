@@ -20,6 +20,13 @@ TQ — the sort+lerp tau quantile (which, unlike torch.quantile, traces under
      dynamo) returns bit-identical taus.
 OG-D — the aux fields the section-10 diagnostics read are the RMS of the delta
      actually returned and the h actually passed in.
+FR — free rate (`CoreConfig.learned_tau`): tau is a Parameter, gets real
+     gradient, survives checkpointing, and the admission rate genuinely moves
+     off target_rate. Paired with FR-D, which holds the default: tau stays a
+     buffer and the rate stays pinned to target_rate whatever the loss wants.
+AB — ABLATION: turning the cores off must CHANGE the logits. M0/M1/M2 all pass
+     even if a correctly computed delta never reaches the logits, which is a
+     gap we found by running the ablation by hand.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -618,6 +625,15 @@ def test_og_delta_diagnostics():
     torch.nn.init.normal_(core.k_dir, std=1.0)
     delta, aux = core(h)
     assert int(aux["delta_group"]) == 1
+    # the score-distribution fields (which say whether a measured rate is a
+    # preference or a threshold the distribution drifted away from)
+    s = (h @ core.k_dir).detach().float().flatten()
+    assert abs(float(aux["s_mean"]) - float(s.mean())) < 1e-6 and \
+        abs(float(aux["s_std"]) - float(s.std())) < 1e-6, \
+        "OG-D FAILED: Core s_mean/s_std are not the gate's own scores"
+    assert abs(float(aux["tau_z"])
+               - (float(core.tau) - float(s.mean())) / float(s.std())) < 1e-4, \
+        "OG-D FAILED: Core tau_z"
     assert abs(float(aux["h_rms"]) - rms(h)) < 1e-5, "OG-D FAILED: Core h_rms"
     assert abs(float(aux["delta_rms"]) - rms(delta)) < 1e-6, \
         "OG-D FAILED: Core delta_rms"
@@ -627,6 +643,12 @@ def test_og_delta_diagnostics():
     randomize_multicore(mc, scale=0.1)
     delta, auxes = mc(h)
     assert len(auxes) == 4
+    sm = torch.einsum('btd,md->btm', h, mc.k_dir).detach().float().reshape(-1, 4)
+    for i, a in enumerate(auxes):
+        # per-core score stats, not the pooled ones
+        assert abs(float(a["s_mean"]) - float(sm[:, i].mean())) < 1e-6 and \
+            abs(float(a["s_std"]) - float(sm[:, i].std())) < 1e-6, \
+            f"OG-D FAILED: MultiCore core {i} s_mean/s_std"
     for a in auxes:
         # one summed delta shared by all M dicts, so group == M
         assert int(a["delta_group"]) == 4, "OG-D FAILED: delta_group != M"
@@ -645,6 +667,245 @@ def test_og_delta_diagnostics():
     print("OG-D PASSED: delta_rms/h_rms/delta_group correct on both paths")
 
 
+def _unit_gates_(mc):
+    """||k_dir[c]|| = 1, so scores are ~N(0,1) for h ~ N(0,1) and tau moves in
+    interpretable units against gate_temp=1.0 (with the std=1.0 directions
+    `randomize_multicore` leaves, s has std sqrt(d) ~ 7 and the soft gate is
+    saturated almost everywhere, which hides tau's gradient)."""
+    with torch.no_grad():
+        mc.k_dir /= mc.k_dir.norm(dim=1, keepdim=True)
+
+
+def _fr_setup(learned_tau, M=3, d=48, rate=0.25, seed=11):
+    """A MultiCore with live (nonzero-out_proj) cores and unit gate
+    directions, identical in both arms but for `learned_tau`."""
+    torch.manual_seed(seed)
+    cc = CoreConfig(K=8, d_core=32, n_heads=2, n_core_layers=2,
+                    target_rate=rate, learned_tau=learned_tau)
+    mc = MultiCore(d, cc, M)
+    randomize_multicore(mc, scale=0.1)        # nonzero out_w -> gate gets grad
+    _unit_gates_(mc)
+    return mc, cc
+
+
+def _fr_train(mc, h, steps=50, lr=0.05, params=None):
+    """`steps` of Adam on a loss that REWARDS larger deltas.
+
+    -mean(delta^2) is the one loss whose preference over tau has a guaranteed
+    sign: delta = out * g, so dL/dtau = -2/temp * mean(out^2 g(1-g)) < 0 for
+    any weights at all. Descent therefore lowers tau, i.e. admits MORE tokens —
+    if tau is free to move. Returns the per-core rates seen on the last step.
+    """
+    ps = list(mc.parameters()) if params is None else list(params)
+    opt = torch.optim.Adam(ps, lr=lr)
+    mc.train()
+    rates = None
+    for _ in range(steps):
+        delta, auxes = mc(h)
+        loss = -delta.float().pow(2).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        rates = [float(a["rate"]) for a in auxes]
+    return rates
+
+
+def test_fr_free_rate_learned_tau():
+    """FR — with `learned_tau` the admission rate is the model's to choose.
+
+    The default gate pins each core's rate to target_rate EXACTLY, every step,
+    by setting tau to the (1-target_rate) score quantile: the model cannot
+    admit more of an information-dense sequence and less of a bland one. This
+    mode replaces the controller with gradient descent on tau, which is how we
+    find out what rate the task loss actually wants.
+
+    Checked here: tau is a Parameter (and only in this mode); the one-time
+    quantile init means the run STARTS at target_rate; the controller is then
+    off; the gradient path through g = sigmoid((s - tau)/temp) is live; the
+    one-time init survives a checkpoint round trip; and the measured rate
+    really moves, far enough that it cannot be quantile noise.
+    """
+    mc, cc = _fr_setup(True)
+    M, d = mc.M, mc.d_model
+    h = torch.randn(4, 64, d)
+
+    # ---- (a) tau is a learned Parameter, and nothing else moved
+    assert isinstance(mc.tau, torch.nn.Parameter), "FR FAILED: tau not a Parameter"
+    assert "tau" in dict(mc.named_parameters()) and \
+        "tau" not in dict(mc.named_buffers()), "FR FAILED: tau still a buffer"
+    assert tuple(mc.tau.shape) == (M,), f"FR FAILED: tau shape {tuple(mc.tau.shape)}"
+
+    # ---- (b) one-time init: the FIRST training forward puts tau at the
+    # (1-target_rate) quantile, so the run starts at the configured rate
+    mc.train()
+    delta, auxes = mc(h)
+    s = torch.einsum('btd,md->btm', h, mc.k_dir).detach().float().reshape(-1, M)
+    want = torch.quantile(s, 1 - cc.target_rate, dim=0)
+    assert torch.allclose(mc.tau.detach(), want, atol=1e-6), \
+        "FR FAILED: tau not initialised to the target-rate quantile"
+    assert bool(mc.tau_initialized), "FR FAILED: tau_initialized not set"
+    rate0 = [float(a["rate"]) for a in auxes]
+    assert all(abs(r - cc.target_rate) < 0.005 for r in rate0), \
+        f"FR FAILED: free-rate run did not START at target_rate ({rate0})"
+
+    # ---- (c) the controller is OFF from then on: another training forward, on
+    # a batch with a 3x wider score distribution, must not touch tau
+    tau0 = mc.tau.detach().clone()
+    mc(torch.randn(4, 64, d) * 3.0)
+    assert torch.equal(mc.tau.detach(), tau0), \
+        "FR FAILED: quantile controller still updating a learned tau"
+
+    # ---- (d) the gradient path (through the soft magnitude) is live
+    mc.zero_grad(set_to_none=True)
+    delta, _ = mc(h)
+    delta.float().pow(2).mean().backward()
+    assert mc.tau.grad is not None, "FR FAILED: tau.grad is None"
+    assert (mc.tau.grad.abs() > 0).all(), \
+        f"FR FAILED: zero grad into tau ({mc.tau.grad.tolist()})"
+    # sign: rewarding bigger deltas must want a LOWER threshold, on every core
+    assert (mc.tau.grad < 0).all(), \
+        f"FR FAILED: d(-delta^2)/dtau should be < 0, got {mc.tau.grad.tolist()}"
+
+    # ---- (e) the one-time init survives checkpointing: a fresh module that
+    # loads this state_dict must NOT re-init tau from its first batch
+    sd = {k: v.clone() for k, v in mc.state_dict().items()}
+    fresh = MultiCore(d, cc, M)
+    fresh.load_state_dict(sd)
+    assert bool(fresh.tau_initialized), "FR FAILED: tau_initialized not in state_dict"
+    fresh.train()
+    fresh(torch.randn(4, 64, d) * 5.0)     # would re-init to a wild quantile
+    assert torch.equal(fresh.tau.detach(), mc.tau.detach()), \
+        "FR FAILED: resumed checkpoint re-initialised tau"
+
+    # ---- (f) and the rate is genuinely FREE. Descend on a loss that rewards
+    # larger deltas, with ONLY tau trainable, so nothing else can be credited.
+    mc2, cc2 = _fr_setup(True)
+    mc2.train()
+    mc2(h)                                  # trigger the one-time init
+    tau_start = mc2.tau.detach().clone()
+    rates = _fr_train(mc2, h, params=[mc2.tau])
+    moved = float((mc2.tau.detach() - tau_start).min())
+    assert moved < -0.5, f"FR FAILED: tau barely moved ({moved:.3f})"
+    assert all(r > 0.5 for r in rates), (
+        f"FR FAILED: rate stayed near target {cc2.target_rate} ({rates}) -- "
+        f"the admission rate is not actually free")
+
+    # the single-Core path carries the same mode
+    core = Core(d, CoreConfig(K=8, d_core=32, n_heads=2, target_rate=0.25,
+                              learned_tau=True))
+    torch.nn.init.normal_(core.out_proj.weight, std=0.1)
+    with torch.no_grad():
+        core.k_dir /= core.k_dir.norm()
+    assert isinstance(core.tau, torch.nn.Parameter) and core.tau.shape == ()
+    core.train()
+    d1, a1 = core(h)
+    d1.float().pow(2).mean().backward()
+    assert float(a1["rate"]) == 0.25 or abs(float(a1["rate"]) - 0.25) < 0.005, \
+        f"FR FAILED: Core did not start at target_rate ({float(a1['rate'])})"
+    assert core.tau.grad is not None and float(core.tau.grad.abs()) > 0, \
+        "FR FAILED: Core tau got no gradient"
+
+    print(f"FR PASSED: learned tau starts at target {cc.target_rate} "
+          f"(rates {[round(r, 4) for r in rate0]}), controller off, grad live; "
+          f"50 steps moved tau by {moved:.2f} and the rate to "
+          f"{[round(r, 3) for r in rates]}")
+
+
+def test_fr_default_rate_pinned():
+    """FR-D — the default (`learned_tau=False`) is untouched.
+
+    tau stays a BUFFER (so it is not in parameters(), gets no optimizer state,
+    and every checkpoint on disk still loads), and the quantile controller
+    keeps the measured rate at target_rate through the very training loop that
+    drags a learned tau to 0.9+ — the rate is not the model's to choose.
+    """
+    mc, cc = _fr_setup(False)
+    d = mc.d_model
+    h = torch.randn(4, 64, d)
+
+    assert not isinstance(mc.tau, torch.nn.Parameter), "FR-D FAILED: tau is a Parameter"
+    assert "tau" in dict(mc.named_buffers()) and \
+        "tau" not in dict(mc.named_parameters()), "FR-D FAILED: tau not a buffer"
+    # the free-rate bookkeeping must not exist in the default mode: an extra
+    # state_dict key would break every checkpoint already written
+    assert not hasattr(mc, "tau_initialized"), \
+        "FR-D FAILED: tau_initialized registered with learned_tau=False"
+    assert "tau_initialized" not in mc.state_dict(), \
+        "FR-D FAILED: state_dict gained a key"
+    ref = Core(d, CoreConfig(K=8, d_core=32, n_heads=2, n_core_layers=2,
+                             target_rate=cc.target_rate))
+    ref.load_state_dict(mc.core_state_dict(0))     # interop still strict-loads
+
+    k0 = mc.k_dir.detach().clone()
+    rates = _fr_train(mc, h)                        # full model, same loss
+    assert all(abs(r - cc.target_rate) < 0.005 for r in rates), \
+        f"FR-D FAILED: controller let the rate drift to {rates}"
+    # and the loop was not a no-op: the gate directions really did move (the
+    # controller is scale- and shift-invariant, which is why the rate did not)
+    moved = float((mc.k_dir.detach() - k0).abs().max())
+    assert moved > 1e-3, f"FR-D vacuous: k_dir never moved ({moved:.2e})"
+    print(f"FR-D PASSED: tau stays a buffer, state_dict unchanged, rate pinned "
+          f"at {cc.target_rate} ({[round(r, 4) for r in rates]}) through 50 "
+          f"steps of the loss that frees it")
+
+
+def test_ab_core_ablation():
+    """AB — the cores must MATTER: `cores_enabled = False` has to change the
+    logits, materially, on every core path.
+
+    This is the gate M0/M1/M2 do not give. M0 asserts the cores are silent at
+    init (delta == 0), M1 that the delta matches the O(T^2) spec, M2 that
+    prefill matches decode — all three still pass if a perfectly correct delta
+    is computed and then dropped on the floor before the head, which is exactly
+    the failure mode we caught by hand-running an ablation. Here the ONLY
+    difference between the two forwards is whether the cores run.
+    """
+    torch.manual_seed(12)
+    cases = {
+        "batched (MultiCore)": small_cfg(),      # two identical -> MultiCore
+        "heterogeneous (Core)": ModelConfig(
+            vocab_size=96, d_model=64, n_layers=3, n_heads=4, window=16,
+            max_seq_len=256, core_layer=1,
+            cores=[CoreConfig(K=4, d_core=32, n_heads=2, target_rate=0.3),
+                   CoreConfig(K=8, d_core=16, n_heads=2, target_rate=0.1)]),
+        "adapter": small_cfg(adapter=True),
+        "free rate": ModelConfig(
+            vocab_size=96, d_model=64, n_layers=3, n_heads=4, window=16,
+            max_seq_len=256, core_layer=1,
+            cores=[CoreConfig(K=4, d_core=32, n_heads=2, target_rate=0.3,
+                              learned_tau=True)] * 2),
+    }
+    got = {}
+    for name, cfg in cases.items():
+        model = SWTransformer(cfg)
+        randomize_core_outputs(model)             # nonzero out_proj / out_w
+        idx = torch.randint(0, 96, (4, 128))
+        model.train()                             # sets tau from the batch
+        with torch.no_grad():
+            model(idx)
+        model.eval()
+        with torch.no_grad():
+            on, auxes = model(idx, collect_aux=True)
+            model.cores_enabled = False
+            off = model(idx)
+            model.cores_enabled = True
+        assert torch.isfinite(on).all() and torch.isfinite(off).all(), \
+            f"AB FAILED [{name}]: non-finite logits"
+        # relative, so the bar cannot be met by a large logit scale alone
+        rel = float((on - off).abs().max() / off.abs().max())
+        assert rel > 0.01, (
+            f"AB FAILED [{name}]: disabling the cores moved the logits by only "
+            f"{rel:.2e} of their scale -- the core delta is not reaching the head")
+        # every core must be admitting something, or the ablation is testing a
+        # subset of the cores
+        for ci, a in enumerate(auxes):
+            assert float(a["rate"]) > 0.0, \
+                f"AB FAILED [{name}]: core {ci} admitted nothing"
+        got[name] = rel
+    print("AB PASSED: cores_enabled=False changes the logits by "
+          + ", ".join(f"{k} {v:.1%}" for k, v in got.items()))
+
+
 if __name__ == "__main__":
     test_m0_bit_identical()
     test_m1_mask_equivalence()
@@ -656,4 +917,7 @@ if __name__ == "__main__":
     test_og_orthogonal_gates()
     test_tq_quantile_tau_unchanged()
     test_og_delta_diagnostics()
+    test_fr_free_rate_learned_tau()
+    test_fr_default_rate_pinned()
+    test_ab_core_ablation()
     print("ALL GATES PASSED")

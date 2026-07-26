@@ -10,6 +10,13 @@ class CoreConfig:
     ffn_mult: int = 4
     target_rate: float = 0.06   # target admission rate
     gate_temp: float = 1.0      # temperature of the soft magnitude gate
+    # FREE RATE. False (default): tau is a buffer pinned every training step to
+    # the exact per-batch (1 - target_rate) score quantile, so the admission
+    # rate IS target_rate by construction and the model has no say in it.
+    # True: tau becomes an nn.Parameter moved only by the task loss (the
+    # quantile controller is off after a one-time init at target_rate), so the
+    # measured rate is what the model WANTS. See core_module._tau_maintain_.
+    learned_tau: bool = False
 
 
 @dataclass

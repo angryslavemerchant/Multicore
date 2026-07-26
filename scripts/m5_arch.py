@@ -28,6 +28,7 @@ Usage:
   python scripts/m5_arch.py --preset base_cores --tokens 2e9 --wandb
 """
 import argparse, json, os, sys, time
+from dataclasses import replace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -119,18 +120,48 @@ def presets(T):
     }
 
 
-def flops_per_token(model, cfg, T):
+def flops_per_token(model, cfg, T, rates=None):
     """Estimated forward FLOPs/token: 2*active_params + attention terms.
-    Core params count at their admission rate (that's the whole point)."""
+    Core params count at their admission rate (that's the whole point).
+
+    `rates` (one per core, in aux-dict order) replaces each core's ADVERTISED
+    `cc.target_rate` with its MEASURED admission rate. With the quantile
+    controller on, the two agree by construction and the default None is the
+    honest static estimate; under `--free-rate` the advertised rate is only
+    where the run started, and a loss can only be read against the compute the
+    model actually chose to spend. See `flops_per_token_measured`.
+
+    A batched `MultiCore` is ONE module holding M cores (its `parameters()`
+    cover all M, and it emits M aux dicts), so its M rates collapse into their
+    mean: every core in it is the same size, so mean-rate x all-M-params is
+    exactly the per-core sum. That also keeps this arithmetic identical to the
+    pre-`rates` version whenever rates == target_rate, measured or not.
+    """
     core_params = sum(sum(p.numel() for p in c.parameters())
                       for c in model.cores)
     base_params = model.num_params() - core_params
     f = 2 * base_params
     f += cfg.n_layers * 2 * 2 * min(cfg.window, T) * cfg.d_model  # base attn
+    i = 0
     for c, cc in zip(model.cores, cfg.cores):
+        n = getattr(c, "M", 1)                     # cores inside this module
+        r = cc.target_rate if rates is None else sum(rates[i:i + n]) / n
+        i += n
         cp = sum(p.numel() for p in c.parameters())
-        f += cc.target_rate * (2 * cp + 2 * 2 * cc.K * cc.d_core)
+        f += r * (2 * cp + 2 * 2 * cc.K * cc.d_core)
     return f
+
+
+def flops_per_token_measured(model, cfg, T, auxes):
+    """FLOPs/token at the admission rates the cores were MEASURED running.
+
+    The static estimate is a property of the config; this is a property of the
+    batch, and under a free rate they are different numbers. Logged every eval
+    as `flops_per_token_measured` next to the static `flops_per_token`, so
+    loss-vs-compute is plotted against compute actually spent.
+    """
+    return flops_per_token(model, cfg, T,
+                           rates=[float(a["rate"]) for a in auxes])
 
 
 # ---------------------------------------------------------------- data
@@ -186,6 +217,18 @@ def core_diagnostics(model, auxes):
       delta_rms_ratio — RMS of the summed core delta over the RMS of the
         residual stream the cores read. Near zero = the cores are dead weight;
         comparable to the residual = they are destabilising the base.
+      rate_mean — mean MEASURED admission rate over the cores. With the
+        quantile controller on this is target_rate by construction and is
+        logged only as a check; under `--free-rate` it is the experiment's
+        answer (what rate the model chooses), and the number
+        `flops_per_token_measured` is computed from.
+      tau_mean / tau_z_mean — the admission threshold, absolute and in units of
+        the score distribution it is a threshold ON: tau_z = (tau - mean s)/
+        std s. Under `--free-rate` tau is the learned parameter and rate_mean
+        is its consequence, so a rate that hits 0 or 1 has to be read against
+        tau_z: |tau_z| of a few means the model chose it, |tau_z| of 10 means
+        the score distribution drifted away from a threshold that could not
+        follow (measured — see core_module._tau_maintain_).
 
     Cosines come off the parameters, so they are exact; Jaccard and the delta
     ratio come off one eval batch's masks/deltas.
@@ -194,6 +237,10 @@ def core_diagnostics(model, auxes):
     out = {}
     if not auxes:
         return out
+    n = len(auxes)
+    for key, dst in (("rate", "rate_mean"), ("tau", "tau_mean"),
+                     ("tau_z", "tau_z_mean")):
+        out[dst] = sum(float(a[key]) for a in auxes) / n
 
     # ---- delta vs residual. `delta_group` says how many aux dicts share one
     # delta (MultiCore's M cores sum into one), so step over each group once;
@@ -229,7 +276,7 @@ def core_diagnostics(model, auxes):
 
 
 # ---------------------------------------------------------------- train
-def evaluate(model, eval_data, device):
+def evaluate(model, eval_data, device, cfg=None, T=None):
     model.eval()
     tot, tot_n, ind, ind_n = 0.0, 0, 0.0, 0
     diag = {}
@@ -242,6 +289,11 @@ def evaluate(model, eval_data, device):
                 logits, auxes = model(idx[:, :-1], collect_aux=True)
             if bi == 0:
                 diag = core_diagnostics(model, auxes)
+                # tau is frozen in eval (I5), so these ARE the rates the
+                # eval loss was produced at
+                if auxes and cfg is not None:
+                    diag["flops_per_token_measured"] = \
+                        flops_per_token_measured(model, cfg, T, auxes)
             ce = F.cross_entropy(logits.reshape(-1, 256).float(),
                                  idx[:, 1:].reshape(-1), reduction="none")
             tot += float(ce.sum()); tot_n += ce.numel()
@@ -277,6 +329,17 @@ def main():
     ap.add_argument("--data-dir", default=None,
                     help="where the byte cache lives (default runs/data)")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--free-rate", action="store_true",
+                    help="learned_tau for every core in the preset: the "
+                         "quantile controller runs once (so the run starts at "
+                         "the preset's target_rate) and after that tau is a "
+                         "parameter the task loss moves, i.e. the admission "
+                         "rate is the model's to choose. Read rate_mean and "
+                         "flops_per_token_measured, not the static estimate -- "
+                         "and read tau_z_mean before believing either: an "
+                         "absolute tau at the base lr is measurably too slow "
+                         "to follow the early drift of the score distribution "
+                         "(core_module._tau_maintain_).")
     ap.add_argument("--no-ortho", action="store_true",
                     help="disable the orthogonal gate-direction constraint "
                          "(plan 5.9). The controlled with/without arm: without "
@@ -296,6 +359,11 @@ def main():
     data = None if args.synthetic else ByteData(
         build_byte_cache(args.data_shards, args.data_dir))
     cfg = presets(T)[args.preset]
+    if args.free_rate:
+        # replace, not mutate: the presets hand out SHARED CoreConfig objects
+        # ([octo] * 8), and dataclass equality is by value, so the batched
+        # MultiCore path still sees eight identical configs.
+        cfg.cores = [replace(c, learned_tau=True) for c in cfg.cores]
     model = SWTransformer(cfg).to(device)
     if args.compile:
         try:
@@ -308,7 +376,8 @@ def main():
         args.iters = int(args.tokens / (args.batch * T))
     print(f"{args.preset}: {n_params/1e6:.1f}M params, "
           f"~{fpt/1e6:.1f}M FLOPs/token, {args.iters} iters "
-          f"({args.iters*args.batch*T/1e9:.2f}B tokens) on {device}",
+          f"({args.iters*args.batch*T/1e9:.2f}B tokens) on {device}"
+          f"{' [FREE RATE: tau learned]' if args.free_rate else ''}",
           flush=True)
 
     run_name = args.run_name or f"m5_{args.preset}_s{args.seed}"
@@ -347,7 +416,20 @@ def main():
                                   synthetic=args.synthetic, seed=args.seed,
                                   split="train", data=data)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1,
+    # tau (only a parameter under --free-rate) is exempt from weight decay:
+    # decay pulls it toward 0, and tau == 0 means "admit every token whose
+    # score is positive", i.e. ~50% -- the optimizer's regulariser would be
+    # choosing the admission rate that this run exists to measure. Without
+    # --free-rate there are no tau parameters and `groups` IS model.parameters().
+    taus = [p for n, p in model.named_parameters() if n.split(".")[-1] == "tau"]
+    if taus:
+        tau_ids = {id(p) for p in taus}
+        groups = [{"params": [p for p in model.parameters()
+                              if id(p) not in tau_ids]},
+                  {"params": taus, "weight_decay": 0.0}]
+    else:
+        groups = model.parameters()
+    opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.1,
                             betas=(0.9, 0.95))
     def lr_at(it):
         if it < args.warmup:
@@ -383,7 +465,7 @@ def main():
         if not args.no_ortho:
             raw_model.reproject_gates()
         if it % args.eval_every == 0 or it == args.iters:
-            m = evaluate(model, eval_data, device)
+            m = evaluate(model, eval_data, device, cfg, T)
             m.update({"iter": it, "loss": float(loss.detach()),
                       "tokens": it * args.batch * T,
                       "tok_per_s": it * args.batch * T / (time.time() - t0)})
@@ -400,6 +482,8 @@ def main():
     # recorded so a stratified loss can never be read against runs that used a
     # different (or, pre-fix, per-config) induction reference distance
     final["ind_window"] = args.ind_window
+    # so a rate_mean can never be mistaken for the controller's target_rate
+    final["free_rate"] = args.free_rate
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:
         json.dump(final, f, indent=2)
     if wb:

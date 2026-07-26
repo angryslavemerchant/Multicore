@@ -17,6 +17,9 @@ def main():
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--free-rate", action="store_true",
+                    help="passed to m5_arch: learned tau, so each core picks "
+                         "its own admission rate (no-op for the dense presets)")
     ap.add_argument("--no-ortho", action="store_true",
                     help="passed to m5_arch: disable orthogonal gate "
                          "directions (the without arm of the ablation)")
@@ -37,6 +40,8 @@ def main():
             cmd.append("--synthetic")
         if args.compile:
             cmd.append("--compile")
+        if args.free_rate:
+            cmd.append("--free-rate")
         if args.no_ortho:
             cmd.append("--no-ortho")
         if args.data_shards:
