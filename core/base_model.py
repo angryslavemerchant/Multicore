@@ -94,8 +94,9 @@ class SWTransformer(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, idx, collect_aux=False):
-        """idx: (B, T) -> logits (B, T, V), aux list (one dict per core)."""
+    def forward(self, idx, collect_aux=False, gate_override=None):
+        """idx: (B, T) -> logits (B, T, V), aux list (one dict per core).
+        gate_override (B, T) bool: oracle admission for all cores."""
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
         h = self.tok_emb(idx) + self.pos_emb(pos)[None]
@@ -104,7 +105,7 @@ class SWTransformer(nn.Module):
             h = blk(h)
             if li == self.cfg.core_layer and self.cores and self.cores_enabled:
                 for core in self.cores:
-                    delta, aux = core(h)
+                    delta, aux = core(h, m_override=gate_override)
                     h = h + delta
                     auxes.append(aux)
         logits = self.head(self.ln_f(h))

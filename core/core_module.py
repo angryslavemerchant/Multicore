@@ -79,10 +79,14 @@ class _CoreCompute(nn.Module):
 class Core(_CoreCompute):
     """Cross-token core (the real thing)."""
 
-    def forward(self, h):
-        """h: (B, T, d) -> (delta (B, T, d), aux dict). Full-sequence path."""
+    def forward(self, h, m_override=None):
+        """h: (B, T, d) -> (delta (B, T, d), aux dict). Full-sequence path.
+        m_override (B, T) bool: oracle admission for diagnosis runs —
+        isolates transport/readback from gate discovery (g forced to 1)."""
         B, T, d = h.shape
         s, m, g = self.gate(h)
+        if m_override is not None:
+            m, g = m_override, torch.ones_like(g)
         aux = {"rate": m.float().mean().detach(), "tau": self.tau.detach().clone(),
                "m": m.detach()}
         if not m.any():
@@ -153,8 +157,10 @@ class TokenAdapter(_CoreCompute):
         super().__init__(d_model, cfg)
         self.mix = nn.Linear(cfg.d_core, cfg.d_core)
 
-    def forward(self, h):
+    def forward(self, h, m_override=None):
         s, m, g = self.gate(h)
+        if m_override is not None:
+            m, g = m_override, torch.ones_like(g)
         aux = {"rate": m.float().mean().detach(), "tau": self.tau.detach().clone(),
                "m": m.detach()}
         a = self.mix(self.v_proj(self.ln(h)))

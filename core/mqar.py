@@ -95,7 +95,7 @@ DEFAULT_BUCKETS = ((0, 64), (64, 128), (128, 256), (256, 10 ** 9))
 
 
 def eval_recall(model, task: MQAR, buckets=DEFAULT_BUCKETS, n_batches=8, B=64,
-                device="cpu"):
+                device="cpu", oracle_fn=None):
     """Accuracy at query positions, bucketed by pair->query gap.
     Returns {"(lo,hi)": acc, ..., "overall": acc}."""
     stats = {bk: [0, 0] for bk in buckets}
@@ -105,7 +105,8 @@ def eval_recall(model, task: MQAR, buckets=DEFAULT_BUCKETS, n_batches=8, B=64,
     with torch.no_grad():
         for _ in range(n_batches):
             idx, labels, gap_map = task.gen_batch(B, device=device)
-            pred = model(idx).argmax(-1)
+            ov = oracle_fn(idx) if oracle_fn else None
+            pred = model(idx, gate_override=ov).argmax(-1)
             mask = labels != -100
             correct = (pred == labels) & mask
             for (lo, hi) in buckets:

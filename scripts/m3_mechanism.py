@@ -34,8 +34,14 @@ def make_cfg(task, variant):
         adapter=(variant == "adapter"))
 
 
+def make_oracle_fn(task):
+    """Force-admit every key/value token (pairs and queries): isolates
+    transport/readback from gate discovery."""
+    return lambda idx: idx >= task.n_filler
+
+
 def run_stage(model, task, iters, B, lr, device, log, eval_every=500,
-              run_dir=None, tag=""):
+              run_dir=None, tag="", oracle_fn=None):
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
@@ -43,7 +49,8 @@ def run_stage(model, task, iters, B, lr, device, log, eval_every=500,
     t0 = time.time()
     for it in range(1, iters + 1):
         idx, labels, _ = task.gen_batch(B, device=device)
-        logits, auxes = model(idx, collect_aux=True)
+        ov = oracle_fn(idx) if oracle_fn else None
+        logits, auxes = model(idx, collect_aux=True, gate_override=ov)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]),
                                labels.view(-1), ignore_index=-100)
         # rate is held by the tau quantile controller, not a loss.
@@ -57,7 +64,7 @@ def run_stage(model, task, iters, B, lr, device, log, eval_every=500,
         sched.step()
         if it % eval_every == 0 or it == iters:
             metrics = eval_recall(model, task, BUCKETS, n_batches=8, B=64,
-                                  device=device)
+                                  device=device, oracle_fn=oracle_fn)
             metrics.update({f"{tag}loss": loss.item(),
                             f"{tag}iter": it,
                             f"{tag}it_per_s": it / (time.time() - t0)})
@@ -74,7 +81,7 @@ def run_stage(model, task, iters, B, lr, device, log, eval_every=500,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", choices=["pretrain", "core", "all"], default="all")
-    ap.add_argument("--variant", choices=["core", "adapter", "none"],
+    ap.add_argument("--variant", choices=["core", "adapter", "none", "oracle"],
                     default="core")
     ap.add_argument("--pretrain-iters", type=int, default=3000)
     ap.add_argument("--iters", type=int, default=4000)
@@ -131,13 +138,15 @@ def main():
         n_train = model.num_params(trainable_only=True)
         print(f"{args.variant}: {n_train/1e6:.3f}M trainable "
               f"({model.num_params()/1e6:.2f}M total)", flush=True)
+        oracle_fn = make_oracle_fn(task) if args.variant == "oracle" else None
         if args.variant == "none":
             final = eval_recall(model, task, BUCKETS, n_batches=16, B=64,
                                 device=device)
             log(final)
         else:
             final = run_stage(model, task, args.iters, args.batch,
-                              args.core_lr, device, log, run_dir=run_dir)
+                              args.core_lr, device, log, run_dir=run_dir,
+                              oracle_fn=oracle_fn)
         final["variant"] = args.variant
         final["trainable_params"] = n_train
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:

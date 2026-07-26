@@ -44,7 +44,7 @@ BLACKLIST = ROOT / ".vast" / "blacklist.json"
 SCAN_OUT  = ROOT / "vast" / "scan_results.json"
 
 REPO_URL  = "https://github.com/angryslavemerchant/Multicore.git"
-REPO_DIR  = "RatNav"
+REPO_DIR  = "Multicore"
 # USER-SPECIFIED (2026-07-14): the official "PyTorch (Vast)" template
 # (template_id 2ad6d615db5927a06fef0c9cd51d77c4), replicated from the CLI
 # command the Vast console generates. @vastai-automatic-tag lets the host
