@@ -76,6 +76,14 @@ def presets(T):
         "smoke_cores_mem": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
             max_seq_len=T, core_layer=4, cores=[hefty, hefty, memory]),
+        # THE MISSING CONTROL: the cores presets' own base, cores removed.
+        # Every cores-vs-dense comparison so far used smoke_dense_local, which
+        # has 11 layers against the cores base's 8 -- so a cores loss could not
+        # be told apart from "three fewer layers". This isolates what the cores
+        # actually add.
+        "smoke_base_only": ModelConfig(
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4, cores=[]),
         "smoke_dense_full": ModelConfig(   # param-matched to smoke_cores
             vocab_size=256, d_model=640, n_layers=12, n_heads=10, window=T,
             max_seq_len=T, core_layer=4, cores=[]),
