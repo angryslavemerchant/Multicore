@@ -61,7 +61,7 @@ TEMPLATE_ENV = (
     "localhost:8384:18384:/:Syncthing|"
     'localhost:6006:16006:/:Tensorboard"'
 )
-DISK_GB   = 25
+DISK_GB   = 45
 
 # SmallCore is a ~50k-parameter model with no dataset: it generates its own
 # walks in-process. It is kernel-launch bound on the sequential position
