@@ -92,6 +92,10 @@ def main():
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--joint", action="store_true",
+                    help="do NOT freeze the base in the core stage: tests the "
+                         "mechanism under joint training (the stage-2 regime) "
+                         "instead of the frozen-retrofit regime")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -134,7 +138,8 @@ def main():
         base_sd = torch.load(args.base_ckpt, map_location=device)
         missing, unexpected = model.load_state_dict(base_sd, strict=False)
         assert not unexpected, f"ckpt keys not in model: {unexpected[:5]}"
-        model.freeze_base()
+        if not args.joint:
+            model.freeze_base()
         n_train = model.num_params(trainable_only=True)
         print(f"{args.variant}: {n_train/1e6:.3f}M trainable "
               f"({model.num_params()/1e6:.2f}M total)", flush=True)
