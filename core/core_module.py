@@ -80,12 +80,11 @@ class _CoreCompute(nn.Module):
         self.d_model = d_model
         dc = cfg.d_core
         self.k_dir = nn.Parameter(torch.randn(d_model) * 0.02)
-        # tau is a train-time quantile controller (EMA of the (1-r)-quantile
-        # of scores -> hard admission rate ~= target_rate by construction),
-        # frozen at inference (invariant I5). Not a learned parameter.
+        # tau is a train-time quantile controller (set to the exact per-batch
+        # (1-r)-quantile of scores -> hard admission rate == target_rate by
+        # construction), frozen at inference (invariant I5). Not a learned
+        # parameter.
         self.register_buffer("tau", torch.zeros(()))
-        self.register_buffer("tau_set", torch.zeros((), dtype=torch.bool))
-        self.tau_momentum = 0.25
         self.ln = nn.LayerNorm(d_model)
         self.in_proj = nn.Linear(d_model, dc)
         self.layers = nn.ModuleList(_CoreLayer(cfg)
@@ -101,15 +100,10 @@ class _CoreCompute(nn.Module):
             with torch.no_grad():
                 q = torch.quantile(s.detach().float().flatten(),
                                    1.0 - self.cfg.target_rate)
-                if not self.tau_set:
-                    # scores carry a large shared offset from the residual
-                    # stream's mean direction; jump straight to the quantile
-                    # instead of EMA-crawling from zero
-                    self.tau.copy_(q)
-                    self.tau_set.fill_(True)
-                else:
-                    self.tau.mul_(1 - self.tau_momentum).add_(
-                        self.tau_momentum * q)
+                # exact per-batch quantile, no EMA: under joint training the
+                # score distribution drifts continuously and an EMA lags,
+                # letting the admission rate creep above target.
+                self.tau.copy_(q)
         m = s > self.tau
         g = torch.sigmoid((s - self.tau) / self.cfg.gate_temp)
         return s, m, g

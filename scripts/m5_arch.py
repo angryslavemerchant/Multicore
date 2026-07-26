@@ -36,6 +36,11 @@ def presets(T):
                        n_core_layers=2, target_rate=1 / 8)
     memory = CoreConfig(K=64, d_core=128, n_heads=4, ffn_mult=2,
                         n_core_layers=2, target_rate=1 / 64)
+    # eight narrower/deeper cores instead of two wide ones: same base, same
+    # per-core rate, more independent gates (SWTransformer builds one Core
+    # module per list entry, so repeating the read-only config is fine)
+    octo = CoreConfig(K=64, d_core=512, n_heads=8, ffn_mult=4,
+                      n_core_layers=3, target_rate=1 / 8)
     return {
         # ---- smoke scale (minutes per run) ----
         # base ~14M + cores ~2x21M -> ~57M params, ~62% in cores;
@@ -43,6 +48,9 @@ def presets(T):
         "smoke_cores": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
             max_seq_len=T, core_layer=4, cores=[hefty, hefty]),
+        "smoke_cores_8x": ModelConfig(
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4, cores=[octo] * 8),
         "smoke_cores_mem": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
             max_seq_len=T, core_layer=4, cores=[hefty, hefty, memory]),
