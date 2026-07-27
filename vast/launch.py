@@ -29,6 +29,7 @@ Examples:
 import argparse
 import base64
 import json
+import os
 import re
 import shutil
 import statistics
@@ -97,8 +98,29 @@ def resolve_profile(args):
     return prof, gpu, max_dph
 
 
-VASTAI = (shutil.which("vastai")
-          or r"C:\Users\JmgLi\anaconda3\envs\ToastEnv\Scripts\vastai.exe")
+def _find_vastai():
+    """The vastai CLI, wherever pip put it.
+
+    `shutil.which` misses it on Windows whenever the interpreter's Scripts
+    directory is not on PATH — which is the normal state for a conda base env
+    — so fall back to the Scripts dir of the interpreter actually running this
+    file. The old hard-coded ToastEnv path went stale when that env was
+    removed, and the failure looked like a vast outage rather than a missing
+    binary.
+    """
+    hit = shutil.which("vastai")
+    if hit:
+        return hit
+    for d in (os.path.join(os.path.dirname(sys.executable), "Scripts"),
+              os.path.dirname(sys.executable)):
+        for name in ("vastai.exe", "vastai"):
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return p
+    return "vastai"          # let the OS raise something legible
+
+
+VASTAI = _find_vastai()
 
 
 # ---------------------------------------------------------------------------

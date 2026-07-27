@@ -8,3 +8,7 @@ matplotlib
 # mid-run; both of these used to arrive as datasets' own dependencies.
 huggingface_hub
 pyarrow
+# the GPT-NeoX tokenizer that builds the uint16 token cache, and the
+# remote-code loader score_ref.py uses to pull open-sci-ref's own modelling
+# file. Not needed by the byte path or by bench_batch.py (synthetic).
+transformers
