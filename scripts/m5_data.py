@@ -371,7 +371,7 @@ class PackedData:
         return torch.from_numpy(buf.astype(np.int32)).to(device).long()
 
     def batches(self, B, T, window, device, seed=0, split="train",
-                with_masks=False, ngram=None, skip=0):
+                with_masks=False, ngram=None, skip=0, stride=1):
         """Yields (idx (B,T+1) long on device, ind_mask (B,T) bool or None).
 
         `skip` advances the generator past the first `skip` batches WITHOUT
@@ -380,6 +380,15 @@ class PackedData:
         that the finished model has seen 0..100M exactly once. Only the RNG
         draw is repeated, never the gather, so fast-forwarding 15k batches
         costs microseconds rather than the 1B symbols of I/O it stands for.
+
+        `stride` skips (stride - 1) batches after each yield. With
+        skip=rank, stride=world_size, the N ranks of a data-parallel run
+        partition ONE stream between them -- rank r takes batches r, r+W,
+        r+2W. Their union is exactly the single-GPU stream, so an 8-GPU run
+        and a 1-GPU run at the same token count see the same data. Without
+        this every rank draws the identical batch and 8 GPUs buy 8x the cost
+        for 1x the data, which trains and converges and looks completely
+        normal on a loss curve.
         """
         lo, hi = self.bounds(split)
         last = hi - (T + 1)
@@ -403,6 +412,8 @@ class PackedData:
                     induction_mask_batch(buf[:, :-1], window, n,
                                          self.bits)).to(device)
             yield idx, masks
+            for _ in range(stride - 1):        # the other ranks' batches
+                rng.integers(lo, last, size=B, endpoint=True)
 
 
 class ByteData(PackedData):

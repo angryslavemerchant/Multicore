@@ -175,10 +175,20 @@ def presets(T):
         # the claim under test is exactly "6.0x the parameters at identical
         # compute": 621.5M params, 595.7M non-embedding, 94% of them in cores.
         #
-        # capacity 2.5 >= M * rate_hi = 8 * 0.30, so the cap never binds before
-        # the range penalty does (core/config.py). Without a cap this preset
-        # OOMs at initialisation, not in steady state -- the router collapse is
-        # transient but the memory spike is not survivable.
+        # capacity 1.25 >= M * rate_hi = 8 * 0.15, so the cap can never bind:
+        # zero dropped tokens by construction, and the learned rates still get
+        # a 1.2x band to differentiate inside. The pair is chosen from the
+        # CHEAP end, not the permissive one -- capacity is a direct multiplier
+        # on expert FLOPs, because the packed buffer is C * N/M slots and the
+        # batched matmul runs over every slot, padding included. Measured on a
+        # 5090 at micro 1: capacity 2.5 -> 40,949 tok/s, 1.25 -> 50,921,
+        # 1.1 -> 52,722. Flat below 1.25, so 1.25 is the floor worth taking.
+        # rate_hi was 0.30 and came down to fit; the freerate ablation measured
+        # quality-neutral (0.90702 vs 0.90915) so a wide band was never worth
+        # paying 2x expert compute for.
+        # Without any cap this preset OOMs at INITIALISATION, not in steady
+        # state -- the router collapse is transient but the spike is not
+        # survivable.
         #
         # Chinchilla for 595.7M non-embedding is ~11.9B tokens; at 1B it sits
         # at 1.7 tokens/param and every expert is starved. Read a short run as
@@ -194,9 +204,9 @@ def presets(T):
                 ffn_hidden=2152, routing="top1_recurrent",
                 n_loops=16, tie_loops=False, inter_core_window=256,
                 residual_scale_init=0.1, router_bias=True,
-                hash_anneal_iters=2000, rate_lo=0.03, rate_hi=0.30,
+                hash_anneal_iters=2000, rate_lo=0.03, rate_hi=0.15,
                 router_range_weight=1.0, router_hash_scale=0.5,
-                capacity_factor=2.5)] * 8),
+                capacity_factor=1.25)] * 8),
 
         # Cheap token-corpus smoke tests: same shapes as the byte smoke presets
         # so the pipeline (uint16 cache, chunked CE, 4-token induction) can be
@@ -322,6 +332,31 @@ def flops_per_token(model, cfg, T, rates=None):
     return f
 
 
+def ddp_setup():
+    """(world, rank, local_rank). Single-process unless launched by torchrun.
+
+    Data parallel, not model parallel: every rank holds a FULL replica and the
+    ranks split the batch. That is the right tool here because the model fits
+    on one GPU — 15.7 GB of a 5090's 32 at capacity 1.25 — so nothing needs
+    sharding across devices.
+    """
+    ws = int(os.environ.get("WORLD_SIZE", "1"))
+    if ws == 1:
+        return 1, 0, 0
+    import torch.distributed as dist
+    local = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local)
+    dist.init_process_group("nccl")
+    return ws, dist.get_rank(), local
+
+
+def unwrap(m):
+    """Strip torch.compile and DDP wrappers, in either order."""
+    for attr in ("_orig_mod", "module", "_orig_mod"):
+        m = getattr(m, attr, m)
+    return m
+
+
 def token_tag(tokens):
     """Filename/run-name tag for a token count: 8e8 -> '800M', 1e9 -> '1B'.
 
@@ -403,7 +438,7 @@ def flops_per_token_measured(model, cfg, T, auxes):
 def stream_batches(B, T, ind_window, device, synthetic=False, seed=0,
                    with_masks=False, split="train", data=None,
                    data_shards=DEFAULT_SHARDS, data_dir=None, vocab_size=256,
-                   skip=0):
+                   skip=0, stride=1):
     """Yields (idx (B,T+1) long, ind_mask (B,T) bool or None) forever.
 
     Non-synthetic: random contiguous windows over the cached local symbol file
@@ -424,6 +459,8 @@ def stream_batches(B, T, ind_window, device, synthetic=False, seed=0,
             torch.randint(0, vocab_size, (B, T + 1), generator=g)
         while True:
             idx = torch.randint(0, vocab_size, (B, T + 1), generator=g)
+            for _ in range(stride - 1):
+                torch.randint(0, vocab_size, (B, T + 1), generator=g)
             masks = (torch.stack([induction_mask(idx[b, :-1], ind_window, n,
                                                  bits)
                                   for b in range(B)])
@@ -433,7 +470,7 @@ def stream_batches(B, T, ind_window, device, synthetic=False, seed=0,
     if data is None:
         data = open_data(vocab_size > 256, data_shards, data_dir)
     yield from data.batches(B, T, ind_window, device, seed=seed, split=split,
-                            with_masks=with_masks, skip=skip)
+                            with_masks=with_masks, skip=skip, stride=stride)
 
 
 # ------------------------------------------------------------- diagnostics
@@ -683,10 +720,15 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    torch.manual_seed(args.seed)
+    world, rank, local = ddp_setup()
+    torch.manual_seed(args.seed)          # same init on every rank
     torch.set_float32_matmul_precision("high")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     T = args.seq_len
+
+    def say(*a, **k):
+        if rank == 0:
+            print(*a, **k)
     # cfg first (it is pure and a typo'd preset should not cost a download),
     # then data -- the build is a one-off download and must not race the model
     # onto the GPU. The preset's vocab picks the corpus: <= 256 is the byte
@@ -705,6 +747,12 @@ def main():
         # MultiCore path still sees eight identical configs.
         cfg.cores = [replace(c, learned_tau=True) for c in cfg.cores]
     model = SWTransformer(cfg).to(device)
+    if world > 1:
+        # DDP then compile: dynamo's DDPOptimizer splits the graph at gradient
+        # bucket boundaries so one bucket's all-reduce overlaps the next
+        # bucket's backward. Wrapping after compiling loses that overlap.
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[local], gradient_as_bucket_view=True)
     if args.compile:
         # dynamic=True ONLY when something in the graph has a data-dependent
         # shape. The cores do: `pack_indices` sizes its buffer by the busiest
@@ -729,12 +777,12 @@ def main():
                 compiled(torch.zeros(args.batch, T, dtype=torch.long,
                                      device=device))
             model = compiled
-            print(f"[compile] on, dynamic={dyn}", flush=True)
+            say(f"[compile] on, dynamic={dyn}", flush=True)
         except Exception as e:
             print(f"[compile] unavailable ({type(e).__name__}: {e}); "
                   f"running EAGER", flush=True)
         model.train()
-    raw_model = getattr(model, "_orig_mod", model)
+    raw_model = unwrap(model)
     head_w = raw_model.head.weight
     fpt = flops_per_token(model, cfg, T)
     n_params = model.num_params()
@@ -747,7 +795,10 @@ def main():
     if not cfg.tie_embeddings:
         emb_params += head_w.numel()
     n_body = n_params - emb_params
-    per_step = args.batch * args.grad_accum * T
+    # every rank contributes its micro-batches, so the OPTIMIZER batch is
+    # world x what one rank sees. Held fixed across world sizes by
+    # dropping grad_accum, so 1 GPU and 8 GPUs solve the same problem.
+    per_step = args.batch * args.grad_accum * T * world
     if args.tokens:
         args.iters = int(args.tokens / per_step)
     if args.warmup_frac > 0:
@@ -769,12 +820,12 @@ def main():
             assert ck[k] == mine, f"resume mismatch on {k}: {ck[k]} vs {mine}"
         raw_model.load_state_dict(ck["model"])
         skip, tok0 = ck["iter"] * ck["grad_accum"], ck["tokens"]
-        print(f"[resume] {args.resume}: step {ck['iter']}, "
+        say(f"[resume] {args.resume}: step {ck['iter']}, "
               f"{tok0/1e6:.4g}M tokens consumed; continuing the stream at "
               f"batch {skip}", flush=True)
     save_at = sorted(int(float(x)) for x in args.save_at.split(",")) \
         if args.save_at else []
-    print(f"{args.preset}: {n_params/1e6:.1f}M params "
+    say(f"{args.preset}: {n_params/1e6:.1f}M params "
           f"({n_body/1e6:.1f}M non-embedding), ~{fpt/1e6:.1f}M FLOPs/token, "
           f"{args.iters} steps x {per_step/1e6:.3f}M tokens "
           f"({args.iters*per_step/1e9:.2f}B tokens) on {device}, "
@@ -805,7 +856,7 @@ def main():
         return round(v, 5) if v == 0.0 or abs(v) >= 1e-4 else float(f"{v:.2e}")
 
     def log(m):
-        print(json.dumps({k: fmt(v) for k, v in m.items()}), flush=True)
+        say(json.dumps({k: fmt(v) for k, v in m.items()}), flush=True)
         if wb:
             wb.log(m)
 
@@ -819,7 +870,8 @@ def main():
     train_stream = stream_batches(args.batch, T, args.ind_window, device,
                                   synthetic=args.synthetic, seed=args.seed,
                                   split="train", data=data,
-                                  vocab_size=cfg.vocab_size, skip=skip)
+                                  vocab_size=cfg.vocab_size,
+                                  skip=skip * world + rank, stride=world)
 
     # tau (only a parameter under --free-rate) is exempt from weight decay:
     # decay pulls it toward 0, and tau == 0 means "admit every token whose
@@ -839,7 +891,7 @@ def main():
                                 betas=(0.9, 0.95), fused=(device == "cuda"))
     except (RuntimeError, ValueError) as e:
         # fused rejects some param layouts; foreach is the next best thing
-        print(f"[opt] fused AdamW unavailable ({e}); using foreach", flush=True)
+        say(f"[opt] fused AdamW unavailable ({e}); using foreach", flush=True)
         opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.1,
                                 betas=(0.9, 0.95))
     if ck is not None:
@@ -909,7 +961,7 @@ def main():
                         "preset": args.preset, "batch": args.batch,
                         "grad_accum": args.grad_accum, "seq_len": T,
                         "seed": args.seed, "lr": args.lr}, path)
-            print(f"CHECKPOINT {path} at {tokens_done/1e6:.4g}M tokens "
+            say(f"CHECKPOINT {path} at {tokens_done/1e6:.4g}M tokens "
                   f"(step {it})", flush=True)
         if it % args.eval_every == 0 or it == args.iters:
             m = evaluate(model, eval_data, device, cfg, T, ce_chunk)
@@ -954,7 +1006,7 @@ def main():
         json.dump(final, f, indent=2)
     if wb:
         wb.finish()
-    print("DONE", flush=True)
+    say("DONE", flush=True)
 
 
 if __name__ == "__main__":

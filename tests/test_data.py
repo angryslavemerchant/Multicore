@@ -204,6 +204,39 @@ def test_sampler_skip_continues_stream():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_sampler_stride_partitions_the_stream():
+    """SHD: N ranks with skip=r, stride=N partition ONE stream exactly.
+
+    This is the data-parallel correctness gate. Without it every rank draws
+    the same batch and N GPUs buy N x the cost for 1 x the data — a bug that
+    trains, converges, and looks entirely normal on a loss curve.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _fake_cache(tmp, n=400000)
+        B, T, W = 3, 32, 4
+        ref = [next(ByteData(path).batches(B, T, 8, "cpu", seed=5))[0]
+               for _ in range(1)]
+        it = ByteData(path).batches(B, T, 8, "cpu", seed=5)
+        ref = [next(it)[0] for _ in range(12)]
+        for r in range(W):
+            rk = ByteData(path).batches(B, T, 8, "cpu", seed=5, skip=r,
+                                        stride=W)
+            for j in range(3):
+                got = next(rk)[0]
+                assert torch.equal(got, ref[r + j * W]), (r, j)
+        # and the ranks are disjoint: no two see the same batch
+        firsts = [next(ByteData(path).batches(B, T, 8, "cpu", seed=5, skip=r,
+                                              stride=W))[0] for r in range(W)]
+        for a in range(W):
+            for b in range(a + 1, W):
+                assert not torch.equal(firsts[a], firsts[b]), (a, b)
+        print(f"SHD PASSED: {W} ranks at stride {W} reproduce the single-GPU "
+              f"stream exactly and share no batch")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_split_disjoint_and_contiguous():
     tmp = tempfile.mkdtemp()
     try:
@@ -399,6 +432,7 @@ if __name__ == "__main__":
     test_induction_mask_token_space()
     test_sampler_deterministic()
     test_sampler_skip_continues_stream()
+    test_sampler_stride_partitions_the_stream()
     test_split_disjoint_and_contiguous()
     test_build_byte_cache_offline()
     test_build_token_cache_offline_and_resume()
