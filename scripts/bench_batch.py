@@ -34,7 +34,8 @@ import torch
 
 from core import SWTransformer
 from core.losses import ce_chunk_default
-from m5_arch import flops_per_token, presets, train_loss
+from m5_arch import (compile_dynamic, flops_per_token,
+                     flops_per_token_executed, presets, train_loss)
 
 
 def ddp_setup():
@@ -57,7 +58,7 @@ def unwrap(m):
 
 
 def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
-            ce_chunk, lr=6e-4, compile_mode=None, world=1):
+            ce_chunk, lr=6e-4, compile_mode=None, world=1, dynamic=None):
     """Steady-state seconds per OPTIMIZER step at this micro-batch."""
     torch.manual_seed(0)
     torch._dynamo.reset()          # each config gets its own static compile
@@ -78,7 +79,7 @@ def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
         # still a measurement -- it is just labelled as eager, because an
         # eager number and a compiled number are not comparable.
         try:
-            kw = {"dynamic": True if cfg.cores else None}
+            kw = {"dynamic": dynamic}
             if compile_mode:
                 kw["mode"] = compile_mode
             c = torch.compile(model, **kw)
@@ -172,6 +173,8 @@ def main():
                     help="rows per CE chunk; 0 disables chunking entirely")
     ap.add_argument("--compile-mode", default=None,
                     choices=("default", "max-autotune", "reduce-overhead"))
+    ap.add_argument("--dynamic", choices=("auto", "true", "false"),
+                    default="auto")
     # Capacity is a DIRECT MULTIPLIER on expert FLOPs, not just a memory
     # bound: the packed buffer is C * N/M slots per expert and the batched
     # matmul runs over all of them, padding included (`valid` is only applied
@@ -221,6 +224,13 @@ def main():
         f"{cfg.cores[0].capacity_factor if cfg.cores else '-'} {args.label}",
         flush=True)
 
+    dyn = (compile_dynamic(cfg) if args.dynamic == "auto"
+           else {"true": True, "false": False}[args.dynamic])
+    ex_f, sem_f = flops_per_token_executed(SWTransformer(cfg), cfg, T)
+    say(f"  dynamic={dyn}  semantic {sem_f/1e6:.1f}M FLOPs/tok, "
+        f"EXECUTED {ex_f/1e6:.1f}M ({ex_f/sem_f:.2f}x -- capacity "
+        f"padding + band overscan)", flush=True)
+
     rows = []
     for micro in [int(x) for x in args.micro.split(",")]:
         # The optimizer batch is held fixed as GPUs are added, so accum falls
@@ -240,7 +250,7 @@ def main():
                                         device, args.compile, args.steps,
                                         args.warmup, ce_chunk,
                                         compile_mode=args.compile_mode,
-                                        world=world)
+                                        world=world, dynamic=dyn)
         except Exception as e:
             if "out of memory" not in str(e).lower() and not isinstance(
                     e, torch.OutOfMemoryError):

@@ -14,17 +14,41 @@ non-embedding, 94% of those in the cores), **342.6M FLOPs/token forward**.
  4 dense prefix layers      full attention, T=4096, d=512, SwiGLU FFN 2256
 16 routed layers            top-1 over 8 experts, weights UNFOLDED (each depth
                             has its own expert weights), SwiGLU FFN 2152,
-                            K=128 same-expert FIFO, capacity factor 1.25
+                            K=128 same-expert FIFO, capacity 1.25 PAIRED
+                            WITH rate_hi=0.15 (8 x 0.15 = 1.2 < 1.25, so the
+                            cap provably never binds: zero drops)
                             + a shared causal W=256 mixer between depths
  4 dense suffix layers
      RMSNorm, per-head qk-norm before RoPE(10k), tied 50304 NeoX embed/head
 ```
 
-It is deliberately FLOPs-matched to `ref_dense_130m` (our reimplementation of
-`open-sci/open-sci-ref-v0.01-0.13b-fineweb-edu-1.4t-300B-4096`): **342.6M vs
-342.8M FLOPs/token, 0.06% apart**, at 6.0x the parameters. So any wall-clock
-difference between them is pure overhead — that is the whole point of the
-comparison and the reason this number matters.
+It is SEMANTICALLY FLOPs-matched to `ref_dense_130m` (our reimplementation of
+`open-sci/open-sci-ref-v0.01-0.13b-fineweb-edu-1.4t-300B-4096`): 342.6M vs
+342.8M FLOPs/token, 0.06% apart, at 6.0x the parameters.
+
+**CORRECTION (this doc said otherwise on first writing).** 342.6M is what the
+architecture is *defined* to compute. It is not what the GPU *runs*. Two
+implementation facts inflate the executed count:
+
+  capacity padding   the packed buffer is `capacity * N/M` slots per expert and
+                     the batched matmul multiplies every slot -- `valid` is not
+                     applied until scatter time. +25% on the expert linear term
+                     at capacity 1.25, every step, bound or not.
+  band overscan      `_banded_attend` gives each block of C=K queries the
+                     W = C+K-1 contiguous keys it needs, so every query scores
+                     ~2x the keys in its own FIFO and masks the rest. Same for
+                     the mixer's sliding window.
+
+`flops_per_token_executed()` in `scripts/m5_arch.py` returns both:
+
+| | semantic | executed | |
+|---|---:|---:|---|
+| `ref_dense_130m` | 342.8M | 342.8M | 1.00x |
+| `cores_620m` | 342.6M | **389.8M** | **1.14x** |
+
+So the measured **2.14x** wall-clock gap decomposes as **1.14x more arithmetic
+executed x 1.88x lower efficiency**. Only the second factor is what fusion work
+can recover; the first needs ragged execution or a narrower band.
 
 ## The measurement
 

@@ -422,6 +422,71 @@ def train_loss(model, head_w, idx, chunk=0):
     return ce, aux, auxes
 
 
+def compile_dynamic(cfg):
+    """`dynamic=` for torch.compile, or None to let dynamo choose.
+
+    STALE CODE PATH, fixed: routed presets used to need dynamic shapes because
+    `pack_indices` sized its buffer by `int(counts.max())` -- a host sync on a
+    data-dependent value, which also showed up as a graph break. With a
+    capacity factor the width is `ceil(capacity * N / M)`, arithmetic on shapes
+    dynamo already knows, so a capped routed model compiles STATIC. That is
+    also the precondition for CUDA graphs.
+
+    Dense -> None (dynamo decides). Capped cores -> False. Uncapped cores ->
+    True, because the packing really is data-dependent there.
+    """
+    if not cfg.cores:
+        return None
+    if all(getattr(c, "capacity_factor", 0) > 0 for c in cfg.cores):
+        return False
+    return True
+
+
+def flops_per_token_executed(model, cfg, T):
+    """FLOPs the GPU actually RUNS, as opposed to the ones the model needs.
+
+    `flops_per_token` counts semantic work: what the architecture is defined to
+    compute. Two things make the routed implementation execute more than that,
+    and reporting only the semantic number makes a compute comparison against a
+    dense model read as fairer than it is.
+
+      CAPACITY PADDING. The packed buffer is `capacity * N/M` slots per expert
+      and `einsum('mpi,mio->mpo')` multiplies every slot, padding included --
+      `valid` is not applied until the deltas are scattered back. So the expert
+      projections cost `capacity` times their semantic FLOPs. At 1.25 that is
+      +25% of the expert linear term, on every step, whether or not any expert
+      is near its cap.
+
+      BAND OVERSCAN. `_banded_attend` walks the K-wide band in blocks of C=K
+      queries, and a block of C queries needs W = C+K-1 contiguous keys. Every
+      query therefore scores W keys and masks away the ~half outside its own
+      K-deep FIFO. Same for the mixer's sliding window. Roughly 2x the
+      attention terms.
+
+    Returns (executed, semantic). The ratio is how much of a wall-clock gap is
+    explained by arithmetic the implementation performs but the architecture
+    does not ask for.
+    """
+    raw = getattr(model, "_orig_mod", model)
+    semantic = flops_per_token(model, cfg, T)
+    routed = [c for c in raw.cores if getattr(c, "is_top1_routed", False)]
+    if not routed:
+        return semantic, semantic
+    core, cc = routed[0], cfg.cores[0]
+    d, L = core.d, cc.n_loops
+    hidden, n_ffn = core.expert.hidden, (3 if core.expert.swiglu else 2)
+    cap = cc.capacity_factor or 1.0
+
+    expert_linear = L * 2 * (4 * d * d + n_ffn * d * hidden)
+    expert_attn = L * 4 * core.expert.K * d
+    extra = expert_linear * (cap - 1.0)          # padding multiplies the GEMMs
+    extra += expert_attn                         # band scans ~2x the keys
+    if core.use_mixer:
+        w = cc.inter_core_window
+        extra += L * 4 * d * keys_per_token(w, T or w)
+    return semantic + extra, semantic
+
+
 def flops_per_token_measured(model, cfg, T, auxes):
     """FLOPs/token at the admission rates the cores were MEASURED running.
 
@@ -699,6 +764,11 @@ def main():
     ap.add_argument("--data-dir", default=None,
                     help="where the byte cache lives (default runs/data)")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--dynamic", choices=("auto", "true", "false"),
+                    default="auto",
+                    help="override torch.compile dynamic shapes. auto = "
+                         "static when every core is capacity-capped "
+                         "(see compile_dynamic)")
     ap.add_argument("--free-rate", action="store_true",
                     help="learned_tau for every core in the preset: the "
                          "quantile controller runs once (so the run starts at "
@@ -761,7 +831,9 @@ def main():
         # straight loss — symbolic shapes block the constant folding and
         # tiling choices inductor makes when it knows T and B. `None` lets
         # dynamo compile static first and fall back if a shape ever moves.
-        dyn = True if cfg.cores else None
+        dyn = compile_dynamic(cfg)
+        if args.dynamic != "auto":
+            dyn = {"true": True, "false": False}[args.dynamic]
         try:
             compiled = torch.compile(model, dynamic=dyn)
             # torch.compile is LAZY: it returns a wrapper and does the work on
