@@ -16,18 +16,21 @@ not a comparison at all — the *_dense_full presets set window == seq_len, so
 no position could reoccur from further back than the window and the slice was
 EMPTY, reporting eval_loss_induction 0.0 as if it were a result.
 
-Data: FineWeb-Edu as UTF-8 bytes (no tokenizer), downloaded once as parquet
-shards and cached as a flat local uint8 file, then sampled deterministically
--- every config sees the identical byte stream for a given seed, and there is
-no live hub connection to drop mid-run. See scripts/m5_data.py; build the
-cache up front with `python scripts/m5_data.py --shards 4`. Use --synthetic
-for a no-network smoke test.
+Data: FineWeb-Edu, either as UTF-8 bytes (vocab 256) or as GPT-NeoX subword
+tokens (vocab 50304) -- the preset's `vocab_size` picks the corpus, so a token
+model can never be handed byte data and quietly report a byte-scale loss.
+Downloaded once as parquet shards and cached as a flat local file, then sampled
+deterministically: every config sees the identical symbol stream for a given
+seed, and there is no live hub connection to drop mid-run. See
+scripts/m5_data.py; build the cache up front with
+`python scripts/m5_data.py --mode tokens --shards 11`. Use --synthetic for a
+no-network smoke test.
 
 Usage:
   python scripts/m5_arch.py --preset smoke_cores --iters 200 --synthetic
   python scripts/m5_arch.py --preset base_cores --tokens 2e9 --wandb
 """
-import argparse, json, os, sys, time
+import argparse, json, math, os, sys, time
 from dataclasses import replace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,13 +38,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 import torch.nn.functional as F
 from core import CoreConfig, ModelConfig, SWTransformer
-from m5_data import (DEFAULT_SHARDS, ByteData, build_byte_cache,
-                     induction_mask)
+from core.base_model import keys_per_token
+from m5_data import (DEFAULT_SHARDS, IND_NGRAM_BYTES, IND_NGRAM_TOKENS,
+                     induction_mask, open_data)
 
-# Reference distance for the induction slice, in bytes. 256 is the window the
+# Reference distance for the induction slice, in symbols. 256 is the window the
 # cores / dense_local presets run, i.e. "beyond what the sliding-window arms can
 # reach" — but it is applied to EVERY config, including the full-attention ones,
 # so the stratified loss compares the same positions everywhere.
+#
+# The UNIT changes with the corpus: 256 bytes of an 8-byte context, or 256
+# tokens of a 4-token context. Both are recorded in metrics.json, because a
+# byte-era eval_loss_induction and a token-era one are different measurements
+# over different position sets and must never be put in the same table.
 IND_REF_WINDOW = 256
 
 # ---------------------------------------------------------------- presets
@@ -140,6 +149,39 @@ def presets(T):
             vocab_size=256, d_model=512, n_layers=13, n_heads=8, window=256,
             max_seq_len=T, core_layer=6, cores=[]),
 
+        # ---- subword tokens (vocab 50304, GPT-NeoX). vocab_size > 256 is what
+        # selects the token corpus, so these cannot be run on byte data.
+        # THE EXTERNAL REFERENCE: open-sci-ref-v0.01-0.13b-fineweb-edu-1.4t-
+        # 300B-4096, reproduced shape-for-shape. 22 layers, d=512, 8 heads
+        # (head_dim 64), FFN 2256 with SwiGLU, RMSNorm, per-head qk-norm, RoPE
+        # 10k, tied embeddings, full attention at seq 4096. ~99M non-embedding
+        # + 25.75M tied embedding params. Their trained checkpoints (37 of
+        # them, iter_2000..iter_72000, 4.13M tokens each) are on the hub, so
+        # this preset exists to train OUR arm at their shape and to check the
+        # parameter arithmetic — scripts/score_ref.py scores THEIR weights on
+        # OUR eval set, which is what makes the two numbers comparable.
+        "ref_dense_130m": ModelConfig(
+            vocab_size=50304, d_model=512, n_layers=22, n_heads=8, window=T,
+            max_seq_len=T, core_layer=11, cores=[], ffn_hidden=2256,
+            rmsnorm=True, swiglu=True, qk_norm=True, tie_embeddings=True),
+        # Cheap token-corpus smoke tests: same shapes as the byte smoke presets
+        # so the pipeline (uint16 cache, chunked CE, 4-token induction) can be
+        # exercised in minutes before anything is rented. The architecture to
+        # actually run against the reference is not decided yet.
+        "smoke_tok_dense": ModelConfig(
+            vocab_size=50304, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4, cores=[],
+            rmsnorm=True, swiglu=True, qk_norm=True, tie_embeddings=True),
+        "smoke_tok_top1": ModelConfig(
+            vocab_size=50304, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4,
+            # 704 -> 472: `routed` sets ffn_hidden explicitly, and an explicit
+            # width is not rescaled for SwiGLU's third matrix (see
+            # base_model.ffn_hidden), so leaving it would be a silent 1.5x FFN.
+            cores=[replace(routed, tie_loops=False, router_bias=True,
+                           hash_anneal_iters=2000, ffn_hidden=472)] * 8,
+            rmsnorm=True, swiglu=True, qk_norm=True, tie_embeddings=True),
+
         # ---- rate sweep: SAME conditional FLOPs (rate x core params fixed),
         # trading sparsity against how much data each core param sees.
         # rate 1/8 => a core param gets gradient from 12.5% of tokens; at a
@@ -190,8 +232,22 @@ def presets(T):
 
 
 def flops_per_token(model, cfg, T, rates=None):
-    """Estimated forward FLOPs/token: 2*active_params + attention terms.
+    """Estimated forward FLOPs/token: 2*active_params + attention + LM head.
     Core params count at their admission rate (that's the whole point).
+
+    Two things this used to get wrong. At the open-sci-ref shape (d=512,
+    V=50304, T=4096, full attention) they together overstated the true 342.8M
+    by 143.7M, i.e. 42%:
+
+      EMBEDDINGS ARE A LOOKUP, not a matmul. Counting the (V, d) table at
+      2*params added 2*V*d = 51.5M FLOPs/token that nothing computes. The
+      table is subtracted here, and the LM head — which IS a matmul — is added
+      back explicitly, so a tied-embedding model (where the two are one
+      tensor) and an untied one are both counted once and correctly.
+
+      CAUSAL ATTENTION AVERAGES (T+1)/2 KEYS, not T. The old min(window, T)
+      was right for a sliding window and 2x too high for the full-attention
+      presets; `keys_per_token` is exact for both.
 
     `rates` (one per core, in aux-dict order) replaces each core's ADVERTISED
     `cc.target_rate` with its MEASURED admission rate. With the quantile
@@ -206,11 +262,17 @@ def flops_per_token(model, cfg, T, rates=None):
     exactly the per-core sum. That also keeps this arithmetic identical to the
     pre-`rates` version whenever rates == target_rate, measured or not.
     """
+    raw = getattr(model, "_orig_mod", model)
     core_params = sum(sum(p.numel() for p in c.parameters())
                       for c in model.cores)
-    base_params = model.num_params() - core_params
+    emb = raw.tok_emb.weight.numel()
+    if raw.pos_emb is not None:
+        emb += raw.pos_emb.weight.numel()
+    base_params = model.num_params() - core_params - emb
     f = 2 * base_params
-    f += cfg.n_layers * 2 * 2 * min(cfg.window, T) * cfg.d_model  # base attn
+    if cfg.tie_embeddings:      # the head IS the table we just subtracted
+        f += 2 * cfg.d_model * cfg.vocab_size
+    f += cfg.n_layers * 4 * cfg.d_model * keys_per_token(cfg.window, T)
     routed = [c for c in model.cores if getattr(c, "is_top1_routed", False)]
     if routed:
         assert len(routed) == 1 and len(model.cores) == 1
@@ -224,6 +286,85 @@ def flops_per_token(model, cfg, T, rates=None):
         cp = sum(p.numel() for p in c.parameters())
         f += r * (2 * cp + 2 * 2 * cc.K * cc.d_core)
     return f
+
+
+def ce_chunk_default(vocab_size):
+    """Rows per cross-entropy chunk. Chunking is pure overhead at vocab 256
+    (the logits are 4 MB per sequence) and is not optional at vocab 50304
+    (824 MB per sequence, in fp32, before the backward copy), so the default
+    follows the vocabulary rather than waiting to be remembered on the CLI."""
+    return 0 if vocab_size <= 1024 else 1024
+
+
+def _ce_chunk(h, w, t):
+    return F.cross_entropy(F.linear(h, w).float(), t, reduction="sum")
+
+
+def ce_sum(h, w, targets, chunk=0):
+    """Summed next-token cross-entropy for logits = h @ w.T, without ever
+    materialising the full (N, V) fp32 logit tensor.
+
+    h (N, d), w (V, d), targets (N,). At vocab 50304 and T=4096 those logits
+    are 824 MB PER SEQUENCE in fp32 and bound the batch size long before the
+    activations do. Chunking the rows and recomputing each chunk's logits in
+    backward (torch.utils.checkpoint) caps the peak at one chunk — 206 MB at
+    chunk=1024. The price is one extra head matmul in backward: 2*d*V per
+    token, which at this shape is 51.5M FLOPs against a ~343M forward, so
+    roughly a sixth of a forward on top of a ~3x-forward backward. Memory
+    bought with a modest amount of arithmetic.
+
+    fp32 for the softmax is not the expensive part and is not negotiable —
+    bf16 has 8 mantissa bits, and a logsumexp over 50304 terms in bf16 loses
+    the small differences the loss is made of. The training itself stays bf16
+    autocast; only this reduction is widened.
+
+    chunk <= 0 is the plain path, identical to
+    F.cross_entropy(logits.float(), targets, reduction="sum").
+    """
+    N = h.shape[0]
+    if chunk <= 0 or chunk >= N:
+        return _ce_chunk(h, w, targets)
+    from torch.utils.checkpoint import checkpoint
+    total = None
+    for i in range(0, N, chunk):
+        part = checkpoint(_ce_chunk, h[i:i + chunk], w, targets[i:i + chunk],
+                          use_reentrant=False)
+        total = part if total is None else total + part
+    return total
+
+
+@torch.no_grad()
+def ce_per_token(h, w, targets, chunk=0):
+    """Per-position cross-entropy (N,) for logits = h @ w.T.
+
+    Eval only: the induction slice needs the per-position values, and with no
+    graph to keep there is nothing to checkpoint — chunking alone bounds the
+    peak."""
+    N = h.shape[0]
+    if chunk <= 0 or chunk >= N:
+        return F.cross_entropy(F.linear(h, w).float(), targets,
+                               reduction="none")
+    return torch.cat([
+        F.cross_entropy(F.linear(h[i:i + chunk], w).float(),
+                        targets[i:i + chunk], reduction="none")
+        for i in range(0, N, chunk)])
+
+
+def train_loss(model, head_w, idx, chunk=0):
+    """The training objective on one micro-batch: mean next-token CE, plus any
+    router aux losses. -> (ce, router_aux, auxes).
+
+    Factored out of the loop so tests exercise the exact code that trains --
+    a vocabulary bug here (the old hard-coded `reshape(-1, 256)`) returns a
+    plausible finite number rather than crashing, so the only real gate is
+    running this path and checking the value against ln(vocab).
+    """
+    hidden, auxes = model(idx[:, :-1], collect_aux=True, return_hidden=True)
+    tgt = idx[:, 1:].reshape(-1)
+    ce = ce_sum(hidden.reshape(-1, hidden.shape[-1]), head_w, tgt,
+                chunk) / tgt.numel()
+    aux = sum((a.get("router_aux_loss", 0.0) for a in auxes), start=0.0)
+    return ce, aux, auxes
 
 
 def flops_per_token_measured(model, cfg, T, auxes):
@@ -241,29 +382,33 @@ def flops_per_token_measured(model, cfg, T, auxes):
 # ---------------------------------------------------------------- data
 def stream_batches(B, T, ind_window, device, synthetic=False, seed=0,
                    with_masks=False, split="train", data=None,
-                   data_shards=DEFAULT_SHARDS, data_dir=None):
+                   data_shards=DEFAULT_SHARDS, data_dir=None, vocab_size=256):
     """Yields (idx (B,T+1) long, ind_mask (B,T) bool or None) forever.
 
-    Non-synthetic: random contiguous windows over the cached local byte file
+    Non-synthetic: random contiguous windows over the cached local symbol file
     (scripts/m5_data.py), drawn from a seeded numpy Generator -- so a given
     (seed, B, T) gives every model config the identical sequence of batches.
     split="eval" draws from the held-out tail, which training never touches.
 
     `ind_window` is the induction slice's reference distance (IND_REF_WINDOW),
     NOT the model's attention window, and it only matters when with_masks --
-    which is the eval stream only.
+    which is the eval stream only. The n-gram length comes from the corpus
+    (8 bytes / 4 tokens); see m5_data.
     """
     if synthetic:
         g = torch.Generator().manual_seed(seed)
+        n = IND_NGRAM_BYTES if vocab_size <= 256 else IND_NGRAM_TOKENS
+        bits = 8 if vocab_size <= 256 else 16
         while True:
-            idx = torch.randint(0, 256, (B, T + 1), generator=g)
-            masks = (torch.stack([induction_mask(idx[b, :-1], ind_window)
+            idx = torch.randint(0, vocab_size, (B, T + 1), generator=g)
+            masks = (torch.stack([induction_mask(idx[b, :-1], ind_window, n,
+                                                 bits)
                                   for b in range(B)])
                      if with_masks else None)
             yield idx.to(device), masks.to(device) if masks is not None else None
         return
     if data is None:
-        data = ByteData(build_byte_cache(data_shards, data_dir))
+        data = open_data(vocab_size > 256, data_shards, data_dir)
     yield from data.batches(B, T, ind_window, device, seed=seed, split=split,
                             with_masks=with_masks)
 
@@ -385,8 +530,9 @@ def core_diagnostics(model, auxes):
 
 
 # ---------------------------------------------------------------- train
-def evaluate(model, eval_data, device, cfg=None, T=None):
+def evaluate(model, eval_data, device, cfg=None, T=None, chunk=0):
     model.eval()
+    head_w = getattr(model, "_orig_mod", model).head.weight
     tot, tot_n, ind, ind_n = 0.0, 0, 0.0, 0
     diag = {}
     with torch.no_grad():
@@ -395,7 +541,8 @@ def evaluate(model, eval_data, device, cfg=None, T=None):
                                 enabled=(device == "cuda")):
                 # collect_aux on every batch (one compiled graph, not two);
                 # the diagnostics are read off the first batch only.
-                logits, auxes = model(idx[:, :-1], collect_aux=True)
+                hidden, auxes = model(idx[:, :-1], collect_aux=True,
+                                      return_hidden=True)
             if bi == 0:
                 diag = core_diagnostics(model, auxes)
                 # tau is frozen in eval (I5), so these ARE the rates the
@@ -411,8 +558,8 @@ def evaluate(model, eval_data, device, cfg=None, T=None):
                         base_f = diag["flops_per_token_measured"] - expert_f - mixer_f
                         diag["flops_per_token_padded"] = (
                             base_f + mixer_f + expert_f * diag["pack_overhead"])
-            ce = F.cross_entropy(logits.reshape(-1, 256).float(),
-                                 idx[:, 1:].reshape(-1), reduction="none")
+            ce = ce_per_token(hidden.reshape(-1, hidden.shape[-1]), head_w,
+                              idx[:, 1:].reshape(-1), chunk)
             tot += float(ce.sum()); tot_n += ce.numel()
             sel = mask.reshape(-1)
             ind += float(ce[sel].sum()); ind_n += int(sel.sum())
@@ -429,20 +576,47 @@ def main():
     ap.add_argument("--iters", type=int, default=20000)
     ap.add_argument("--tokens", type=float, default=None,
                     help="overrides --iters: train until this many tokens")
-    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--batch", type=int, default=16,
+                    help="MICRO batch: sequences per forward. The optimizer "
+                         "sees --batch * --grad-accum of them.")
+    ap.add_argument("--grad-accum", type=int, default=1,
+                    help="micro-batches accumulated per optimizer step. What "
+                         "makes the batch size a free variable: the reference "
+                         "runs at 1008 sequences x 4096 = 4.13M tokens/step, "
+                         "and a 16-sequence step is a different optimisation "
+                         "problem at the same token count, not the same one "
+                         "run cheaply. Set batch to what fits and grad_accum "
+                         "to whatever reaches the target.")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--warmup", type=int, default=200)
+    ap.add_argument("--warmup-frac", type=float, default=0.0,
+                    help="if > 0, warmup = this fraction of --iters, "
+                         "overriding --warmup. A fixed step count cannot serve "
+                         "a token ladder: 300 steps is 8% of a 1B-token run "
+                         "and 79% of a 100M-token one.")
+    ap.add_argument("--schedule", choices=("cosine", "wsd"), default="cosine",
+                    help="cosine (to 0) or warmup-stable-decay. open-sci-ref "
+                         "uses WSD; Pythia uses cosine. WSD holds the peak lr "
+                         "until the last --decay-frac of steps and then "
+                         "decays linearly to --final-lr-frac of it.")
+    ap.add_argument("--decay-frac", type=float, default=0.2)
+    ap.add_argument("--final-lr-frac", type=float, default=0.0)
+    ap.add_argument("--ce-chunk", type=int, default=None,
+                    help="rows per cross-entropy chunk (see ce_sum). Default "
+                         "follows the vocabulary: 0 (off) at vocab <= 1024, "
+                         "1024 above it.")
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--eval-batches", type=int, default=8)
     ap.add_argument("--ind-window", type=int, default=IND_REF_WINDOW,
-                    help="reference distance (bytes) for the induction slice. "
-                         "FIXED across configs on purpose -- using each "
-                         "model's own cfg.window made the metric incomparable, "
-                         "and empty for window==seq_len presets.")
+                    help="reference distance (SYMBOLS -- bytes or tokens, "
+                         "whichever the preset's vocab selects) for the "
+                         "induction slice. FIXED across configs on purpose -- "
+                         "using each model's own cfg.window made the metric "
+                         "incomparable, and empty for window==seq_len presets.")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--data-shards", type=int, default=DEFAULT_SHARDS,
                     help="FineWeb-Edu parquet shards to cache locally; each "
-                         "yields 3.47 GB of bytes (a run consumes ~1.5e9)")
+                         "yields 3.47 GB of bytes, or ~0.75B NeoX tokens")
     ap.add_argument("--data-dir", default=None,
                     help="where the byte cache lives (default runs/data)")
     ap.add_argument("--compile", action="store_true")
@@ -471,11 +645,18 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     T = args.seq_len
-    # data first: a missing/failed cache should cost nothing (and the build is
-    # a one-off download, so it must not race the model onto the GPU)
-    data = None if args.synthetic else ByteData(
-        build_byte_cache(args.data_shards, args.data_dir))
+    # cfg first (it is pure and a typo'd preset should not cost a download),
+    # then data -- the build is a one-off download and must not race the model
+    # onto the GPU. The preset's vocab picks the corpus: <= 256 is the byte
+    # cache, above it the uint16 NeoX-token cache. Nothing else is consulted,
+    # so a token model can never be fed byte data and report a byte-scale loss
+    # that looks like a triumph.
     cfg = presets(T)[args.preset]
+    tokenized = cfg.vocab_size > 256
+    data = None if args.synthetic else open_data(
+        tokenized, args.data_shards, args.data_dir)
+    ce_chunk = (ce_chunk_default(cfg.vocab_size) if args.ce_chunk is None
+                else args.ce_chunk)
     if args.free_rate:
         # replace, not mutate: the presets hand out SHARED CoreConfig objects
         # ([octo] * 8), and dataclass equality is by value, so the batched
@@ -487,13 +668,30 @@ def main():
             model = torch.compile(model, dynamic=True)
         except Exception as e:
             print(f"torch.compile unavailable ({e}); running eager", flush=True)
+    raw_model = getattr(model, "_orig_mod", model)
+    head_w = raw_model.head.weight
     fpt = flops_per_token(model, cfg, T)
     n_params = model.num_params()
+    # Non-embedding params: the number that is comparable across vocabularies.
+    # Embeddings scale V*d and the body scales L*d^2, so at vocab 50304 the
+    # (V, d) table is 25.75M of a 125M "0.13B" model -- quoting totals would
+    # make "% of params in the cores" partly a statement about a lookup table.
+    emb_params = raw_model.tok_emb.weight.numel() + (
+        0 if raw_model.pos_emb is None else raw_model.pos_emb.weight.numel())
+    if not cfg.tie_embeddings:
+        emb_params += head_w.numel()
+    n_body = n_params - emb_params
+    per_step = args.batch * args.grad_accum * T
     if args.tokens:
-        args.iters = int(args.tokens / (args.batch * T))
-    print(f"{args.preset}: {n_params/1e6:.1f}M params, "
-          f"~{fpt/1e6:.1f}M FLOPs/token, {args.iters} iters "
-          f"({args.iters*args.batch*T/1e9:.2f}B tokens) on {device}"
+        args.iters = int(args.tokens / per_step)
+    if args.warmup_frac > 0:
+        args.warmup = max(1, int(args.warmup_frac * args.iters))
+    print(f"{args.preset}: {n_params/1e6:.1f}M params "
+          f"({n_body/1e6:.1f}M non-embedding), ~{fpt/1e6:.1f}M FLOPs/token, "
+          f"{args.iters} steps x {per_step/1e6:.3f}M tokens "
+          f"({args.iters*per_step/1e9:.2f}B tokens) on {device}, "
+          f"{'tokens' if tokenized else 'bytes'} corpus, ce_chunk={ce_chunk}, "
+          f"lr {args.lr:g} {args.schedule} warmup {args.warmup}"
           f"{' [FREE RATE: tau learned]' if args.free_rate else ''}",
           flush=True)
 
@@ -527,11 +725,13 @@ def main():
     # the train split never reaches. Same bytes for every config and run.
     eval_stream = stream_batches(args.batch, T, args.ind_window, device,
                                  synthetic=args.synthetic, seed=args.seed + 999,
-                                 with_masks=True, split="eval", data=data)
+                                 with_masks=True, split="eval", data=data,
+                                 vocab_size=cfg.vocab_size)
     eval_data = [next(eval_stream) for _ in range(args.eval_batches)]
     train_stream = stream_batches(args.batch, T, args.ind_window, device,
                                   synthetic=args.synthetic, seed=args.seed,
-                                  split="train", data=data)
+                                  split="train", data=data,
+                                  vocab_size=cfg.vocab_size)
 
     # tau (only a parameter under --free-rate) is exempt from weight decay:
     # decay pulls it toward 0, and tau == 0 means "admit every token whose
@@ -549,17 +749,29 @@ def main():
     opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.1,
                             betas=(0.9, 0.95))
     def lr_at(it):
+        """Linear warmup, then cosine to 0 or WSD (hold, then linear decay).
+
+        WSD exists because open-sci-ref uses it and cosine-vs-WSD is a real
+        difference in where a run's loss sits at a fixed token count. The
+        decay SHAPE here is linear over the last `decay_frac`; open-sci-ref's
+        exact schedule is not reproduced, so this narrows the gap rather than
+        closing it — say so when reporting against them.
+        """
         if it < args.warmup:
             return args.lr * it / args.warmup
-        import math
         p = (it - args.warmup) / max(args.iters - args.warmup, 1)
-        return args.lr * 0.5 * (1 + math.cos(math.pi * p))
+        if args.schedule == "cosine":
+            return args.lr * 0.5 * (1 + math.cos(math.pi * p))
+        start = 1.0 - args.decay_frac
+        if p <= start:
+            return args.lr
+        frac = (p - start) / max(args.decay_frac, 1e-9)
+        return args.lr * (1 - frac * (1 - args.final_lr_frac))
 
     # gate directions are orthogonalised once before step 1 and re-projected
     # after every step, so collapse is structurally unreachable rather than
     # merely penalised (plan 5.9). Skipped entirely under --no-ortho, which
     # leaves the pre-mechanism behaviour bit-identical.
-    raw_model = getattr(model, "_orig_mod", model)
     if not args.no_ortho:
         raw_model.reproject_gates()
 
@@ -569,29 +781,41 @@ def main():
     for it in range(1, args.iters + 1):
         for grp in opt.param_groups:
             grp["lr"] = lr_at(it)
-        idx, _ = next(train_stream)
-        with torch.autocast(device, dtype=torch.bfloat16,
-                            enabled=(device == "cuda")):
-            logits, auxes = model(idx[:, :-1], collect_aux=True)
-            ce_loss = F.cross_entropy(logits.reshape(-1, 256).float(),
-                                      idx[:, 1:].reshape(-1))
-            router_aux_loss = sum((a.get("router_aux_loss", 0.0)
-                                   for a in auxes), start=0.0)
-            loss = ce_loss + router_aux_loss
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        # Accumulated losses stay TENSORS across the inner loop: a float()
+        # here would sync the device once per micro-batch, and at the
+        # accumulation depths this exists for (63 micro-batches to reach the
+        # reference's 1008 sequences) that is 63 stalls a step to log a number
+        # read once every --eval-every.
+        ce_acc = aux_acc = None
+        for _ in range(args.grad_accum):
+            idx, _ = next(train_stream)
+            with torch.autocast(device, dtype=torch.bfloat16,
+                                enabled=(device == "cuda")):
+                ce_loss, router_aux_loss, auxes = train_loss(
+                    model, head_w, idx, ce_chunk)
+                loss = (ce_loss + router_aux_loss) / args.grad_accum
+            loss.backward()
+            ce_d = ce_loss.detach()
+            aux_d = (router_aux_loss.detach()
+                     if torch.is_tensor(router_aux_loss)
+                     else torch.as_tensor(float(router_aux_loss),
+                                          device=ce_d.device))
+            ce_acc = ce_d if ce_acc is None else ce_acc + ce_d
+            aux_acc = aux_d if aux_acc is None else aux_acc + aux_d
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if not args.no_ortho:
             raw_model.reproject_gates()
         if it % args.eval_every == 0 or it == args.iters:
-            m = evaluate(model, eval_data, device, cfg, T)
-            m.update({"iter": it, "loss": float(loss.detach()),
-                      "ce_loss": float(ce_loss.detach()),
-                      "router_aux_loss": float(router_aux_loss.detach()) if
-                      torch.is_tensor(router_aux_loss) else float(router_aux_loss),
-                      "tokens": it * args.batch * T,
-                      "tok_per_s": it * args.batch * T / (time.time() - t0)})
+            m = evaluate(model, eval_data, device, cfg, T, ce_chunk)
+            ce_mean = float(ce_acc) / args.grad_accum
+            aux_mean = float(aux_acc) / args.grad_accum
+            m.update({"iter": it, "loss": ce_mean + aux_mean,
+                      "ce_loss": ce_mean,
+                      "router_aux_loss": aux_mean,
+                      "tokens": it * per_step,
+                      "tok_per_s": it * per_step / (time.time() - t0)})
             for ci, a in enumerate(auxes):
                 m[f"core{ci}_rate"] = float(a["rate"])
             final = m
@@ -601,10 +825,17 @@ def main():
                        os.path.join(run_dir, "latest.pt"))
     final["preset"] = args.preset
     final["params"] = n_params
+    final["params_non_embedding"] = n_body
     final["flops_per_token"] = fpt
+    final["tokens_per_step"] = per_step
     # recorded so a stratified loss can never be read against runs that used a
-    # different (or, pre-fix, per-config) induction reference distance
+    # different (or, pre-fix, per-config) induction reference distance -- or,
+    # now, a different UNIT: 256 bytes of 8-byte context and 256 tokens of
+    # 4-token context are not the same slice of the same corpus.
     final["ind_window"] = args.ind_window
+    final["ind_units"] = "tokens" if tokenized else "bytes"
+    final["ind_ngram"] = IND_NGRAM_TOKENS if tokenized else IND_NGRAM_BYTES
+    final["vocab_size"] = cfg.vocab_size
     # so a rate_mean can never be mistaken for the controller's target_rate
     final["free_rate"] = args.free_rate
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:

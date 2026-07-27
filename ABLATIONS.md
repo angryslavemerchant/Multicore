@@ -14,6 +14,23 @@ full-attention ones, so the compared positions are the same everywhere.
 BPB = bits per byte = nats / ln 2. Tokenizer-independent, and the unit published
 byte-level work reports.
 
+> **FLOPs column, 2026-07-27.** `flops_per_token` was corrected afterwards on
+> two counts: it billed the embedding table as a matmul (`2*V*d`, but a lookup
+> is free), and it charged `min(window, T)` keys per query instead of the exact
+> causal average, which over-counts the ramp over the first `window` positions
+> (240.06 keys, not 256, at window 256 and T 2048). Every row above is
+> overstated by **1.0-1.1%** — `dense_local_pm` by 0.77% — and the code now
+> prints `unfold`/`loopmix`/`freerate` at 43,262,496, `dense_local` at
+> 43,292,448, `multik` at 43,557,408, `nomix` at 38,617,344, `dense_local_pm`
+> at 88,617,600.
+>
+> **No conclusion below changes.** The FLOPs match is unmoved
+> (`unfold`/`dense_local` 0.9993 before and after — they carry the same eleven
+> window-256 attentions), and the parameter-matched control goes from 2.042x to
+> 2.048x. The correction matters at vocab 50304, where the embedding error
+> alone is 51.5M FLOPs/token against a ~343M total; see
+> `tests/test_routed.py::test_flops_accounting`.
+
 ## Results
 
 | run | params | in cores | FLOPs/tok | overall | BPB | induction | ind BPB | tok/s | pack_util |

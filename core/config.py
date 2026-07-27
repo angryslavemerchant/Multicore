@@ -44,7 +44,12 @@ class CoreConfig:
     #                      actually lets traffic shares move.
     #   hash_anneal_iters  linearly decay router_hash_scale to 0 over N steps,
     #                      so the positional prior keeps experts alive early
-    #                      and then gets out of the way. 0 disables.
+    #                      and then gets out of the way. 0 disables. COUNTED IN
+    #                      FORWARD PASSES, not optimizer steps -- under
+    #                      --grad-accum G the anneal finishes G times sooner in
+    #                      steps than the number here suggests. (The balance
+    #                      losses are likewise computed on micro-batch routing
+    #                      statistics, as in every MoE implementation.)
     #   rate_lo/rate_hi    range penalty bounds. Exactly zero penalty while
     #                      every expert is inside the band.
     router_bias: bool = False
@@ -61,13 +66,30 @@ class CoreConfig:
 
 @dataclass
 class ModelConfig:
-    vocab_size: int = 256
+    # 50304 = the GPT-NeoX vocab padded to a multiple of 128, which is what
+    # open-sci-ref and every model we compare against use. vocab_size <= 256
+    # is what selects the byte-level data path in scripts/m5_arch.py, so the
+    # byte presets say 256 explicitly and nothing infers the wrong corpus.
+    vocab_size: int = 50304
     d_model: int = 256
     n_layers: int = 4
     n_heads: int = 4
     window: int = 64            # sliding-window attention width (includes self)
-    max_seq_len: int = 1024
+    max_seq_len: int = 4096
     core_layer: int = 2         # cores inserted after this block (0-based)
     cores: list = field(default_factory=list)   # list[CoreConfig]
     adapter: bool = False       # per-token control variant instead of cores
     rope: bool = True           # rotary positions (False: learned absolute)
+    ffn_mult: int = 4            # base-block FFN width multiplier
+    ffn_hidden: int = 0          # 0 -> derived from ffn_mult (see base_model)
+    # ---- 2021-vs-now recipe. open-sci-ref-0.01 (our external dense reference)
+    # is RMSNorm + SwiGLU + per-head qk-norm + tied embeddings; our base was
+    # LayerNorm + GELU + untied. All four default OFF, so every byte-era preset
+    # and every checkpoint on disk is bit-identical to before. Set them on a
+    # preset and they apply to BOTH arms — the base blocks and the routed
+    # expert blocks — because a recipe change that reached only the dense
+    # control would be indistinguishable from the thing under test.
+    rmsnorm: bool = False
+    swiglu: bool = False        # keeps the FFN parameter budget fixed (2/3 h)
+    qk_norm: bool = False       # per-head RMSNorm on q and k, before RoPE
+    tie_embeddings: bool = False

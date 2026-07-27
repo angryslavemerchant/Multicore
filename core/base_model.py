@@ -56,6 +56,98 @@ def _rope_apply(x, cos, sin):
     return out
 
 
+# ------------------------------------------------------------- recipe pieces
+# RMSNorm / SwiGLU / qk-norm, the three places open-sci-ref-0.01 (and every
+# modern small dense model) differs from the LayerNorm + GELU base this repo
+# started from. Each is opt-in via ModelConfig so the byte-era runs stay
+# reproducible; see core/config.py.
+RMS_EPS = 1e-5
+
+
+def _rms(x, eps=RMS_EPS):
+    """RMS-normalise the last axis, in fp32.
+
+    fp32 on purpose, matching what autocast already does to `F.layer_norm`:
+    the reduction is over d_model terms of a bf16 residual stream, and doing
+    it in bf16 costs ~3 decimal digits on the scale every downstream matmul
+    is multiplied by. Returns fp32; the following matmul casts it back under
+    autocast, exactly as with the LayerNorm path.
+    """
+    f = x.float()
+    return f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + eps)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=RMS_EPS):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(self, x):
+        return (_rms(x, self.eps) * self.weight).to(x.dtype)
+
+
+def _norm(cfg, d):
+    return RMSNorm(d) if cfg.rmsnorm else nn.LayerNorm(d)
+
+
+class SwiGLU(nn.Module):
+    """down(silu(gate(x)) * up(x)) — three matrices where GELU-MLP has two."""
+
+    def __init__(self, d, hidden, bias=True):
+        super().__init__()
+        self.gate = nn.Linear(d, hidden, bias=bias)
+        self.up = nn.Linear(d, hidden, bias=bias)
+        self.down = nn.Linear(hidden, d, bias=bias)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+def ffn_hidden(d, mult=4, swiglu=False, explicit=0, multiple_of=8):
+    """Inner FFN width. `explicit` (ModelConfig/CoreConfig ffn_hidden) wins.
+
+    Otherwise `mult * d`, scaled by 2/3 under SwiGLU: three matrices of width h
+    cost 3*d*h against the GELU MLP's 2*d*h, so the unscaled width would make
+    `swiglu=True` a 1.5x parameter and FLOPs change wearing a nonlinearity's
+    name. With the scaling, flipping the flag changes the nonlinearity and
+    nothing else — which is the only way the ablation means anything.
+
+    An `explicit` width is taken at face value and NOT rescaled, because it
+    cannot be known whether the author already sized it for SwiGLU (2256 in
+    open-sci-ref-0.01: yes) or for GELU (704 in the routed presets: no). Turn
+    swiglu on over an explicit width and you have asked for 1.5x the FFN;
+    m5_arch prints the resulting hidden width and parameter count.
+    """
+    if explicit:
+        return explicit
+    h = mult * d
+    if swiglu:
+        h = 2 * h // 3
+    return -(-h // multiple_of) * multiple_of
+
+
+def _mlp(cfg, d):
+    h = ffn_hidden(d, cfg.ffn_mult, cfg.swiglu, cfg.ffn_hidden)
+    if cfg.swiglu:
+        return SwiGLU(d, h)
+    return nn.Sequential(nn.Linear(d, h), nn.GELU(), nn.Linear(h, d))
+
+
+def keys_per_token(window, T):
+    """Mean number of keys a query attends, averaged over a length-T causal
+    sequence with attention window `window`. The FLOPs multiplier for both
+    QK^T and A@V, so attention costs 4 * d_model * this, per layer per token.
+
+    Exact for both regimes rather than the `min(window, T)` it replaces:
+    query i attends min(i+1, window) keys, so full attention (window >= T)
+    averages (T+1)/2, not T. That factor of 2 is not a rounding detail — at
+    T=4096, d=512, 22 layers it is 92M FLOPs/token against a ~99M body.
+    """
+    w = min(window, T)
+    return (w * (w + 1) / 2 + max(T - w, 0) * w) / T
+
+
 # ------------------------------------------------- banded sliding-window
 def _sw_band_layout(T, window, C, device):
     """Block-banded layout for causal sliding-window attention.
@@ -122,14 +214,27 @@ class SWAttention(nn.Module):
         self.rope = cfg.rope
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
+        # qk-norm: RMSNorm over each head's d_head, applied BEFORE RoPE (which
+        # is a rotation, so it commutes with a per-head rescale only if the
+        # norm comes first — and that is the order open-sci-ref uses).
+        self.qk_norm = cfg.qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.d_head)
+            self.k_norm = RMSNorm(self.d_head)
 
     def _split(self, x, B, T):
         return x.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+    def _qk(self, q, k):
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
+        return q, k
 
     def forward(self, x):
         B, T, C = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = self._split(q, B, T), self._split(k, B, T), self._split(v, B, T)
+        q, k = self._qk(q, k)
         if self.rope:
             cos, sin = _rope_cos_sin(self.d_head, torch.arange(T, device=x.device))
             q, k = _rope_apply(q, cos, sin), _rope_apply(k, cos, sin)
@@ -151,6 +256,7 @@ class SWAttention(nn.Module):
         B, _, C = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = self._split(q, B, 1), self._split(k, B, 1), self._split(v, B, 1)
+        q, k = self._qk(q, k)
         if self.rope:
             cos, sin = _rope_cos_sin(
                 self.d_head, torch.tensor(t, device=x.device))
@@ -176,7 +282,8 @@ class _RoutedExpertBlock(nn.Module):
     n_loops ordinary layers at identical FLOPs.
     """
 
-    def __init__(self, d: int, cfg: CoreConfig, M: int):
+    def __init__(self, d: int, cfg: CoreConfig, M: int, rmsnorm=False,
+                 swiglu=False):
         super().__init__()
         # Heterogeneous FIFO lengths: every ring is padded to K_max so the
         # banded kernel keeps one width, and `k_gate` masks expert m down to
@@ -189,7 +296,8 @@ class _RoutedExpertBlock(nn.Module):
         self.n_heads = cfg.n_heads
         self.d_head = d // cfg.n_heads
         self.n_loops = cfg.n_loops
-        hidden = cfg.ffn_hidden or cfg.ffn_mult * d
+        self.rmsnorm, self.swiglu = rmsnorm, swiglu
+        hidden = ffn_hidden(d, cfg.ffn_mult, swiglu, cfg.ffn_hidden)
         assert d % cfg.n_heads == 0
         self.hidden = hidden
         # One weight set when tied, n_loops of them when unfolded. `_slice`
@@ -206,6 +314,9 @@ class _RoutedExpertBlock(nn.Module):
         self.f1_b = nn.Parameter(torch.zeros(S, hidden))
         self.f2_w = _stacked(S, hidden, d)
         self.f2_b = nn.Parameter(torch.zeros(S, d))
+        if swiglu:                       # the gate branch; f1 becomes the "up"
+            self.f3_w = _stacked(S, d, hidden)
+            self.f3_b = nn.Parameter(torch.zeros(S, hidden))
         self.rel_bias = nn.Parameter(torch.zeros(S, cfg.n_heads, self.K))
         # Additive, non-learnable: 0 where the gap is inside that expert's
         # FIFO, a large negative otherwise. Finite rather than -inf so an
@@ -217,16 +328,37 @@ class _RoutedExpertBlock(nn.Module):
         self.register_buffer("k_gate", gate)
         shape = (cfg.n_loops, M, d)
         self.ln1_w = nn.Parameter(torch.ones(shape))
-        self.ln1_b = nn.Parameter(torch.zeros(shape))
         self.ln2_w = nn.Parameter(torch.ones(shape))
-        self.ln2_b = nn.Parameter(torch.zeros(shape))
+        if not rmsnorm:                  # RMSNorm is scale-only, no bias
+            self.ln1_b = nn.Parameter(torch.zeros(shape))
+            self.ln2_b = nn.Parameter(torch.zeros(shape))
         scale = torch.full((cfg.n_loops, M), cfg.residual_scale_init)
         self.attn_scale = nn.Parameter(scale.clone())
         self.ffn_scale = nn.Parameter(scale.clone())
 
-    @staticmethod
-    def _ln(x, w, b):
+    def _ln(self, x, loop, which):
+        """Per-(depth, expert) norm over the packed (M, P, d) stream."""
+        w = (self.ln1_w if which == 1 else self.ln2_w)[loop]
+        if self.rmsnorm:
+            return _rms(x) * w[:, None, :]
+        b = (self.ln1_b if which == 1 else self.ln2_b)[loop]
         return F.layer_norm(x, (x.shape[-1],)) * w[:, None, :] + b[:, None, :]
+
+    def _ln_one(self, x, loop, expert, which):
+        """Same norm for the decode path, where x is (S, d) or (S, K, d) and
+        the affine is a single expert's (d,) row."""
+        w = (self.ln1_w if which == 1 else self.ln2_w)[loop, expert]
+        if self.rmsnorm:
+            return _rms(x) * w
+        b = (self.ln1_b if which == 1 else self.ln2_b)[loop, expert]
+        return F.layer_norm(x, (self.d,)) * w + b
+
+    def _ffn(self, xn, s):
+        """Packed FFN for weight-block `s`: GELU MLP, or SwiGLU when enabled."""
+        up = _bl(xn, self.f1_w[s], self.f1_b[s])
+        h = (F.silu(_bl(xn, self.f3_w[s], self.f3_b[s])) * up if self.swiglu
+             else F.gelu(up))
+        return _bl(h, self.f2_w[s], self.f2_b[s])
 
     def _heads(self, x):
         M, P, _ = x.shape
@@ -239,7 +371,7 @@ class _RoutedExpertBlock(nn.Module):
 
     def forward_packed(self, x, valid, row, loop):
         s = self._slice(loop)
-        xn = self._ln(x, self.ln1_w[loop], self.ln1_b[loop])
+        xn = self._ln(x, loop, 1)
         q = self._heads(_bl(xn, self.q_w[s], self.q_b[s]))
         k = self._heads(_bl(xn, self.k_w[s], self.k_b[s]))
         v = self._heads(_bl(xn, self.v_w[s], self.v_b[s]))
@@ -249,9 +381,7 @@ class _RoutedExpertBlock(nn.Module):
         a = a.permute(0, 2, 1, 3).reshape(self.M, x.shape[1], self.d)
         x = x + self.attn_scale[loop, :, None, None] * _bl(a, self.o_w[s],
                                                            self.o_b[s])
-        xn = self._ln(x, self.ln2_w[loop], self.ln2_b[loop])
-        f = _bl(F.gelu(_bl(xn, self.f1_w[s], self.f1_b[s])),
-                self.f2_w[s], self.f2_b[s])
+        f = self._ffn(self._ln(x, loop, 2), s)
         return x + self.ffn_scale[loop, :, None, None] * f
 
     def step_one(self, expert, loop, x, xkv, valid, query_rank, kv_rank):
@@ -262,9 +392,8 @@ class _RoutedExpertBlock(nn.Module):
         which carry the extra depth blocks when the recurrence is unfolded.
         """
         e = self._slice(loop).start + expert
-        w1, b1 = self.ln1_w[loop, expert], self.ln1_b[loop, expert]
-        qn = F.layer_norm(x, (self.d,)) * w1 + b1
-        kn = F.layer_norm(xkv, (self.d,)) * w1 + b1
+        qn = self._ln_one(x, loop, expert, 1)
+        kn = self._ln_one(xkv, loop, expert, 1)
 
         def heads(z):
             S, P, _ = z.shape
@@ -281,11 +410,12 @@ class _RoutedExpertBlock(nn.Module):
         a = a.transpose(1, 2).reshape(x.shape[0], self.d)
         x = x + self.attn_scale[loop, expert] * (
             a @ self.o_w[e] + self.o_b[e])
-        w2, b2 = self.ln2_w[loop, expert], self.ln2_b[loop, expert]
-        xn = F.layer_norm(x, (self.d,)) * w2 + b2
-        f = F.gelu(xn @ self.f1_w[e] + self.f1_b[e])
-        f = f @ self.f2_w[e] + self.f2_b[e]
-        return x + self.ffn_scale[loop, expert] * f
+        xn = self._ln_one(x, loop, expert, 2)
+        up = xn @ self.f1_w[e] + self.f1_b[e]
+        h = (F.silu(xn @ self.f3_w[e] + self.f3_b[e]) * up if self.swiglu
+             else F.gelu(up))
+        return x + self.ffn_scale[loop, expert] * (h @ self.f2_w[e]
+                                                   + self.f2_b[e])
 
 
 class Top1LoopedMultiCore(nn.Module):
@@ -318,10 +448,11 @@ class Top1LoopedMultiCore(nn.Module):
         # Training-step counter for the hash anneal. Kept as a buffer and used
         # as a tensor throughout, so reading it never forces a device sync.
         self.register_buffer("_step", torch.zeros((), dtype=torch.long))
-        self.expert = _RoutedExpertBlock(d, cfg, M)
+        self.expert = _RoutedExpertBlock(d, cfg, M, model_cfg.rmsnorm,
+                                         model_cfg.swiglu)
         if self.use_mixer:
             self.mixer_ln = nn.ModuleList(
-                nn.LayerNorm(d) for _ in range(cfg.n_loops))
+                _norm(model_cfg, d) for _ in range(cfg.n_loops))
             self.mixer = SWAttention(model_cfg, window=cfg.inter_core_window)
             self.mix_scale = nn.Parameter(torch.full(
                 (cfg.n_loops,), cfg.residual_scale_init))
@@ -481,12 +612,16 @@ class Top1LoopedMultiCore(nn.Module):
 
     def estimated_flops_parts(self, T=None):
         d, hidden, L = self.d, self.expert.hidden, self.cfg.n_loops
-        expert_linear = 2 * (4 * d * d + 2 * d * hidden)
+        n_ffn = 3 if self.expert.swiglu else 2
+        expert_linear = 2 * (4 * d * d + n_ffn * d * hidden)
+        # the FIFO is K entries deep and always full past the warm-up, so
+        # unlike the base attention there is no causal ramp to average over
         expert_attention = 4 * self.expert.K * d
         if not self.use_mixer:
             return (L * (expert_linear + expert_attention), 0)
         mixer_linear = 2 * 4 * d * d
-        mixer_attention = 4 * min(self.cfg.inter_core_window, T or self.cfg.inter_core_window) * d
+        w = self.cfg.inter_core_window
+        mixer_attention = 4 * d * keys_per_token(w, T or w)
         return (L * (expert_linear + expert_attention),
                 L * (mixer_linear + mixer_attention))
 
@@ -501,12 +636,10 @@ class Block(nn.Module):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = _norm(cfg, cfg.d_model)
         self.attn = SWAttention(cfg)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.d_model, 4 * cfg.d_model), nn.GELU(),
-            nn.Linear(4 * cfg.d_model, cfg.d_model))
+        self.ln2 = _norm(cfg, cfg.d_model)
+        self.mlp = _mlp(cfg, cfg.d_model)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -525,7 +658,7 @@ class SWTransformer(nn.Module):
         self.pos_emb = None if cfg.rope else nn.Embedding(cfg.max_seq_len,
                                                           cfg.d_model)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layers))
-        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.ln_f = _norm(cfg, cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         cls = TokenAdapter if cfg.adapter else Core
         self.top1_routed = (bool(cfg.cores) and
@@ -540,6 +673,14 @@ class SWTransformer(nn.Module):
         self.batched_cores = (not self.top1_routed and not cfg.adapter and
                               len(cfg.cores) > 1 and
                               all(c == cfg.cores[0] for c in cfg.cores))
+        # The threshold-gated Core/MultiCore path is still LayerNorm + GELU:
+        # the recipe flags were plumbed through the base blocks and the routed
+        # experts, which are the two arms under comparison. Refuse the
+        # combination rather than ship a half-converted model whose loss would
+        # be attributed to the recipe.
+        assert not (cfg.cores and not self.top1_routed
+                    and (cfg.rmsnorm or cfg.swiglu)), \
+            "rmsnorm/swiglu are not implemented for threshold-gated cores"
         if self.top1_routed:
             self.cores = nn.ModuleList(
                 [Top1LoopedMultiCore(cfg, cfg.cores[0], len(cfg.cores))])
@@ -550,6 +691,13 @@ class SWTransformer(nn.Module):
             self.cores = nn.ModuleList(cls(cfg.d_model, c) for c in cfg.cores)
         self.cores_enabled = True
         self.apply(self._init)
+        # AFTER _init, so the head does not get its own draw and then have it
+        # discarded. Tying saves V*d parameters (25.75M at the open-sci-ref
+        # shape, i.e. a fifth of that model) and is what every model we compare
+        # against does; `parameters()` de-duplicates the shared tensor, so
+        # num_params() and the optimizer both see it once.
+        if cfg.tie_embeddings:
+            self.head.weight = self.tok_emb.weight
         # re-zero core outputs (self.apply above overwrote them)
         for c in self.cores:
             c.zero_out_()
@@ -563,9 +711,17 @@ class SWTransformer(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, idx, collect_aux=False, gate_override=None):
+    def forward(self, idx, collect_aux=False, gate_override=None,
+                return_hidden=False):
         """idx: (B, T) -> logits (B, T, V), aux list (one dict per core).
-        gate_override (B, T) bool: oracle admission for all cores."""
+        gate_override (B, T) bool: oracle admission for all cores.
+
+        `return_hidden` returns the final normed hidden states (B, T, d)
+        INSTEAD of logits, so the caller can fuse the head into a chunked
+        cross-entropy. At vocab 50304 and T=4096 the fp32 logits are 824 MB
+        per sequence, which bounds the batch long before anything else does;
+        see `m5_arch.ce_sum`.
+        """
         B, T = idx.shape
         h = self.tok_emb(idx)
         if self.pos_emb is not None:
@@ -583,8 +739,9 @@ class SWTransformer(nn.Module):
                         auxes.extend(aux)
                     else:
                         auxes.append(aux)
-        logits = self.head(self.ln_f(h))
-        return (logits, auxes) if collect_aux else logits
+        h = self.ln_f(h)
+        out = h if return_hidden else self.head(h)
+        return (out, auxes) if collect_aux else out
 
     @torch.no_grad()
     def reproject_gates(self):

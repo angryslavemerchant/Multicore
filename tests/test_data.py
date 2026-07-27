@@ -1,20 +1,24 @@
 """Data-pipeline gates for scripts/m5_data.py. No network required.
 
-IND — the vectorized induction_mask is byte-for-byte identical to the
+IND — the vectorized induction_mask is symbol-for-symbol identical to the
       per-position dict loop it replaced (that loop is copied verbatim below
-      as the ground truth).
-DET — the byte sampler is deterministic: a given (seed, B, T, split) yields
-      the identical sequence of batches every time, from a fresh process
-      state, so two model configs are compared on the same bytes.
-SPL — train windows lie entirely in the head of the byte file and eval
-      windows in the held-out tail; the splits share no bytes.
+      as the ground truth), for 8-bit bytes and for 16-bit token ids.
+DET — the sampler is deterministic: a given (seed, B, T, split) yields the
+      identical sequence of batches every time, from a fresh process state,
+      so two model configs are compared on the same symbols. Checked for the
+      uint8 byte file and the uint16 token file.
+SPL — train windows lie entirely in the head of the file and eval windows in
+      the held-out tail; the splits share no symbols.
 BLD — the parquet -> flat-uint8 conversion writes each doc's utf-8 bytes plus
       one 0 separator, and a second call reuses the cache instead of
       rebuilding (run against a local parquet, with the hub stubbed out).
+TOK — the parquet -> flat-uint16 conversion writes each doc's ids plus one
+      eos, and a build killed mid-way resumes at the next SHARD rather than
+      restarting or appending a duplicate.
 
 Runnable via pytest or `python tests/test_data.py`.
 """
-import os, shutil, sys, tempfile
+import json, os, shutil, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(
@@ -23,8 +27,8 @@ sys.path.insert(0, os.path.join(
 import numpy as np
 import torch
 
-from m5_data import (ByteData, induction_mask, induction_mask_batch,
-                     induction_mask_np)
+from m5_data import (ByteData, TokenData, build_token_cache, induction_mask,
+                     induction_mask_batch, induction_mask_np)
 
 
 def induction_mask_loop(chunk, window, n=8):
@@ -86,6 +90,48 @@ def test_induction_mask_matches_loop():
             f"IND FAILED: batch row {i}"
     print(f"IND PASSED: vectorized induction_mask == dict loop on "
           f"{len(cases)} random cases ({hits} induction positions)")
+
+
+def test_induction_mask_token_space():
+    """The same equivalence at 16 bits, which is the token corpus's key width.
+
+    The old implementation cast to uint8 unconditionally, so a subword id
+    would have wrapped mod 256 and silently reported the induction positions
+    of a different sequence. That is now an error, and 4x16 bits is the widest
+    n-gram a uint64 key holds.
+    """
+    g = torch.Generator().manual_seed(1)
+    hits = 0
+    # a SMALL alphabet of LARGE ids: 4-grams over 50304 uniform ids never
+    # repeat in a few hundred positions, so a uniform draw would make this
+    # vacuous. Every id here needs more than 8 bits, which is the point.
+    for pool in (torch.tensor([300, 50303]),
+                 torch.tensor([256, 999, 4096, 65535]),
+                 torch.tensor([511, 512, 32767, 32768, 50304 - 1])):
+        for T in (128, 777):
+            for window in (0, 16, 128):
+                x = pool[torch.randint(0, len(pool), (T,), generator=g)]
+                ref = induction_mask_loop(x, window, n=4)
+                fast = induction_mask(x, window, n=4, bits=16)
+                assert torch.equal(fast, ref), (pool.tolist(), T, window)
+                hits += int(ref.sum())
+    assert hits > 0, "IND vacuous: no token induction positions"
+    # a key that does not fit must raise, not wrap
+    for bad in ((torch.tensor([256, 1, 2, 3, 4]), 8, 8),
+                (torch.tensor([65536, 1, 2, 3, 4]), 4, 16)):
+        x, n, bits = bad
+        try:
+            induction_mask(x, 1, n=n, bits=bits)
+            raise AssertionError(f"IND FAILED: {bits}-bit overflow not caught")
+        except ValueError:
+            pass
+    try:
+        induction_mask(torch.zeros(9, dtype=torch.long), 1, n=5, bits=16)
+        raise AssertionError("IND FAILED: 5x16 bits accepted for a uint64 key")
+    except ValueError:
+        pass
+    print(f"IND-TOK PASSED: 4-token induction_mask == dict loop over 16-bit "
+          f"ids ({hits} positions); overflow and >64-bit keys rejected")
 
 
 def _fake_cache(tmp, n=200000, seed=7):
@@ -195,9 +241,136 @@ def test_build_byte_cache_offline():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+class _StubTokenizer:
+    """Deterministic stand-in for the NeoX tokenizer: no network, no import.
+
+    Ids are spread across the whole uint16 range on purpose — a 1-byte-ish
+    vocabulary would let a truncating write pass.
+    """
+    eos_token_id = 0
+    name_or_path = "stub"
+
+    def __call__(self, texts, add_special_tokens=False):
+        return {"input_ids": [[1 + (hash_(t) + i) % 50000
+                               for i in range(3 + len(t) % 5)]
+                              for t in texts]}
+
+
+def hash_(s):
+    h = 0
+    for c in s:
+        h = (h * 131 + ord(c)) % 65521
+    return h
+
+
+def _stub_hub(tmp, docs, n_shards):
+    """Point m5_data's shard list + download at one local parquet."""
+    import huggingface_hub
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import m5_data
+    src = os.path.join(tmp, "shard.parquet")
+    pq.write_table(pa.table({"text": docs}), src)
+    real = (huggingface_hub.hf_hub_download, m5_data.shard_names)
+    huggingface_hub.hf_hub_download = lambda **kw: src
+    m5_data.shard_names = lambda n, *a, **k: [f"fake/{i:03d}.parquet"
+                                              for i in range(n)]
+    return real
+
+
+def test_build_token_cache_offline_and_resume():
+    """TOK: uint16 layout, eos separators, and shard-level resume."""
+    import huggingface_hub
+    import m5_data
+    tmp = tempfile.mkdtemp()
+    docs = ["hello world", "déjà vu — café", "x" * 900, ""]
+    tok = _StubTokenizer()
+    real = _stub_hub(tmp, docs, 3)
+    try:
+        out = build_token_cache(3, data_dir=tmp, tokenizer=tok, doc_batch=2)
+        arr = np.fromfile(out, dtype=np.uint16)
+        want = np.concatenate([
+            np.asarray(d + [0], dtype=np.uint16)
+            for _ in range(3)
+            for d in tok([t for t in docs if t])["input_ids"]])
+        assert np.array_equal(arr, want), (arr[:20], want[:20])
+        assert int((arr == 0).sum()) == 3 * 3, "wrong separator count"
+        assert arr.max() > 255, "TOK vacuous: no id needs more than 8 bits"
+        assert not os.path.exists(out + ".partial")
+        assert not os.path.exists(out + ".progress")
+
+        # a build killed after shard 1 must resume, not restart or duplicate
+        os.rename(out, out + ".partial")
+        with open(out + ".partial", "r+b") as f:      # a torn trailing write
+            f.truncate((len(arr) // 3) * 2 + 6)
+        names = m5_data.shard_names(3)
+        json.dump({"names": names, "tokenizer": "stub", "shards": 1,
+                   "tokens": len(arr) // 3, "docs": 3},
+                  open(out + ".progress", "w"))
+        again = build_token_cache(3, data_dir=tmp, tokenizer=tok, doc_batch=2)
+        assert np.array_equal(np.fromfile(again, dtype=np.uint16), arr), \
+            "TOK FAILED: resumed file differs from a clean build"
+
+        # a cache hit must not rebuild
+        huggingface_hub.hf_hub_download = lambda **kw: (_ for _ in ()).throw(
+            AssertionError("TOK FAILED: rebuilt despite a valid cache"))
+        assert build_token_cache(3, data_dir=tmp, tokenizer=tok) == out
+        print(f"TOK PASSED: {len(arr)} uint16 tokens (max id {arr.max()}), "
+              f"eos separator per doc, resume from shard 1 byte-identical")
+    finally:
+        huggingface_hub.hf_hub_download, m5_data.shard_names = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_token_sampler():
+    """DET/SPL for the uint16 path, incl. the widening torch cannot do."""
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "fake_u16.bin")
+        rng = np.random.default_rng(11)
+        raw = rng.integers(0, 50304, size=200000, dtype=np.uint16)
+        raw.tofile(path)
+        B, T = 3, 64
+
+        def first_k(seed, split, k=3, with_masks=False):
+            it = TokenData(path).batches(B, T, 16, "cpu", seed=seed,
+                                         split=split, with_masks=with_masks)
+            return [next(it) for _ in range(k)]
+
+        a, b = first_k(0, "train"), first_k(0, "train")
+        for i, ((x, _), (y, _)) in enumerate(zip(a, b)):
+            assert x.shape == (B, T + 1) and x.dtype == torch.long
+            assert torch.equal(x, y), f"DET FAILED: token batch {i} differs"
+            # ids above 32767 must survive the trip: torch has no uint16, and
+            # a naive int16 view would make them negative
+            assert int(x.min()) >= 0 and int(x.max()) < 50304, \
+                (int(x.min()), int(x.max()))
+        assert not torch.equal(a[0][0], first_k(1, "train")[0][0]), \
+            "DET vacuous: a different seed gave the same batch"
+        d = TokenData(path)
+        for split, (lo, hi) in (("train", (0, d.n_train)),
+                                ("eval", (d.n_train, d.n))):
+            for idx, _ in first_k(3, split, k=4):
+                for r in range(B):
+                    row = idx[r].numpy().astype(np.uint16)
+                    off = next(i for i in range(lo, hi - T)
+                               if np.array_equal(raw[i:i + T + 1], row))
+                    assert lo <= off and off + T + 1 <= hi, (split, off)
+        e = first_k(0, "eval", k=1, with_masks=True)[0][1]
+        assert e.shape == (B, T) and e.dtype == torch.bool
+        big = int((raw > 32767).sum())
+        print(f"DET/SPL PASSED (tokens): uint16 windows reproducible and "
+              f"split-confined; {big} of {raw.size} ids exceed int16")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_induction_mask_matches_loop()
+    test_induction_mask_token_space()
     test_sampler_deterministic()
     test_split_disjoint_and_contiguous()
     test_build_byte_cache_offline()
+    test_build_token_cache_offline_and_resume()
+    test_token_sampler()
     print("ALL DATA GATES PASSED")

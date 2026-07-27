@@ -1,4 +1,4 @@
-"""Deterministic, cached byte-level data for the M5 runs.
+"""Deterministic, cached FineWeb-Edu for the M5 runs, in bytes or in tokens.
 
 Replaces the old live `load_dataset(..., streaming=True)` path over
 HuggingFaceFW/fineweb-edu, which was (a) fragile -- the hub connection drops
@@ -7,39 +7,65 @@ mid-run ("peer closed connection without sending complete message body",
 cost two runs including a rented GPU -- and (b) non-deterministic, so two
 model configs never saw the same bytes and their losses were not comparable.
 
-Pipeline:
-  1. hf_hub_download the deterministic first N parquet shards of the
-     `sample-10BT` config (resumable + cached on disk, and every hub call is
-     wrapped in an exponential-backoff retry, since the hub is the flaky bit).
-  2. Convert ONCE to a flat uint8 file runs/data/fineweb_<N>shards.bin: each
-     document's utf-8 bytes (errors="ignore") followed by a single 0
-     separator. Rebuilt only if that file is missing/empty.
-     Measured: each 2.15 GB parquet shard is 726k docs -> 3.47 GB of bytes
-     (~25 s to convert), so the default 4 shards ~= 13.9 GB, about 9x the
-     ~1.5e9 bytes a full run consumes. Use --data-shards 1 (3.47 GB, still
-     2x a run) when disk is tight; the parquet shards can be deleted from
-     the HF cache once the .bin exists.
-  3. Sample batches as B random contiguous (T+1)-byte windows drawn from a
+TWO CORPORA, one pipeline:
+
+  bytes   `sample/10BT`, utf-8 bytes + a 0x00 document separator, flat uint8.
+          Every result before 2026-07-27 was produced this way. Kept working
+          and bit-identical so those runs stay reproducible.
+  tokens  `sample/100BT`, GPT-NeoX subword ids + `<|endoftext|>` (id 0) as the
+          separator, flat uint16. This is what the comparisons against
+          published models need: open-sci-ref-0.01 trained on FineWeb-Edu with
+          the GPT-NeoX tokenizer at vocab 50304, and a byte-level loss cannot
+          be put on the same axis as a token-level one at all. `sample/100BT`
+          is the same document pool as `sample/10BT`, just a bigger draw --
+          10BT would not cover a single 8.3B-token reference checkpoint.
+
+uint16 caps the vocabulary at 65535; the NeoX vocab is 50277 (50304 padded),
+and `build_token_cache` asserts every id fits rather than trusting that.
+
+Pipeline (both modes):
+  1. hf_hub_download the deterministic first N parquet shards (resumable +
+     cached on disk, and every hub call is wrapped in an exponential-backoff
+     retry, since the hub is the flaky bit).
+  2. Convert ONCE to a flat file under runs/data/. Measured: each 2.15 GB
+     `sample/10BT` shard is 726k docs -> 3.47 GB of bytes (~25 s), which is
+     ~0.75B NeoX tokens (1.5 GB as uint16). So a 1.5e9-BYTE run wants ~1 shard
+     and a 8.3e9-TOKEN run wants ~11. Tokenising is the slow half (minutes per
+     shard, not seconds), so the token build records its progress and resumes
+     at the next shard instead of restarting.
+  3. Sample batches as B random contiguous (T+1)-symbol windows drawn from a
      seeded numpy Generator, so a given (seed, B, T) yields the identical
      sequence of batches for every model config. The last EVAL_FRAC of the
      file is eval-only; training samples strictly from the head, so eval
-     bytes are never trained on.
+     symbols are never trained on.
 
 Standalone use (do this once on a fresh machine, before launching runs):
-  python scripts/m5_data.py --shards 4
+  python scripts/m5_data.py --shards 4                 # bytes
+  python scripts/m5_data.py --mode tokens --shards 11  # tokens
 """
-import argparse, os, time
+import argparse, json, os, time
 
 import numpy as np
 import torch
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
 REPO_ID = "HuggingFaceFW/fineweb-edu"
 SUBDIR = "sample/10BT"            # the `sample-10BT` config: 14 parquet shards
+SUBDIR_TOKENS = "sample/100BT"    # same pool, big enough for a real token run
+TOKENIZER = "EleutherAI/gpt-neox-20b"
 DEFAULT_SHARDS = 4
 DEFAULT_DATA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runs", "data")
-EVAL_FRAC = 0.05                  # last 5% of the byte file is eval-only
+EVAL_FRAC = 0.05                  # last 5% of the file is eval-only
 SEP = 0                           # document separator byte
+
+# Induction n-gram length. The key is packed into ONE uint64, so it is 8
+# symbols of 8 bits or 4 of 16 -- and 4 subword tokens is a longer span of text
+# than 8 bytes anyway. Byte-era and token-era induction numbers are measuring
+# different position sets and must not be compared.
+IND_NGRAM_BYTES = 8
+IND_NGRAM_TOKENS = 4
 
 
 # ---------------------------------------------------------------- hub fetch
@@ -91,6 +117,14 @@ def download_shards(n_shards=DEFAULT_SHARDS, repo_id=REPO_ID, subdir=SUBDIR):
     return paths
 
 
+def _fetch(name, repo_id):
+    from huggingface_hub import hf_hub_download
+    print(f"[data] fetching {name}", flush=True)
+    return _retry(lambda: hf_hub_download(repo_id=repo_id, filename=name,
+                                          repo_type="dataset"),
+                  f"download {name}")
+
+
 # ---------------------------------------------------------------- byte cache
 def byte_cache_path(n_shards=DEFAULT_SHARDS, data_dir=None):
     return os.path.join(data_dir or DEFAULT_DATA_DIR,
@@ -112,16 +146,12 @@ def build_byte_cache(n_shards=DEFAULT_SHARDS, data_dir=None, repo_id=REPO_ID,
     names = shard_names(n_shards, repo_id, subdir)
     print(f"[data] building {out} from {len(names)} shard(s): "
           f"{', '.join(names)}", flush=True)
-    from huggingface_hub import hf_hub_download
     total = ndocs = 0
     reported = 0
     t0 = time.time()
     with open(tmp, "wb", buffering=1 << 22) as f:
         for name in names:
-            print(f"[data] fetching {name}", flush=True)
-            path = _retry(lambda n=name: hf_hub_download(
-                repo_id=repo_id, filename=n, repo_type="dataset"),
-                f"download {name}")
+            path = _fetch(name, repo_id)
             pf = pq.ParquetFile(path)
             for rb in pf.iter_batches(batch_size=4096, columns=["text"]):
                 docs = [t.encode("utf-8", "ignore") + bytes([SEP])
@@ -143,28 +173,141 @@ def build_byte_cache(n_shards=DEFAULT_SHARDS, data_dir=None, repo_id=REPO_ID,
     return out
 
 
+# --------------------------------------------------------------- token cache
+def token_cache_path(n_shards=DEFAULT_SHARDS, data_dir=None,
+                     tokenizer=TOKENIZER):
+    tag = tokenizer.split("/")[-1].replace(".", "-")
+    return os.path.join(data_dir or DEFAULT_DATA_DIR,
+                        f"fineweb100_{tag}_{n_shards}shards_u16.bin")
+
+
+def build_token_cache(n_shards=DEFAULT_SHARDS, data_dir=None, repo_id=REPO_ID,
+                      subdir=SUBDIR_TOKENS, tokenizer=TOKENIZER,
+                      doc_batch=1024):
+    """Return the path to the flat uint16 token file, building it if needed.
+
+    Documents are concatenated as `ids + [eos]`, exactly as the byte cache
+    concatenates `utf-8 + 0x00`, so a sampled window may span a document
+    boundary and the model sees the separator as an ordinary token. That is
+    what open-sci-ref (and essentially every pretraining pipeline) does.
+
+    Tokenising is minutes per shard rather than the byte path's seconds, so
+    progress is recorded per shard in a `.progress` sidecar and a restart
+    truncates the partial file back to the last completed shard instead of
+    starting over. The sidecar carries the shard LIST, so changing --shards or
+    the tokenizer invalidates it rather than silently appending the wrong data.
+
+    `tokenizer` is a hub name, or an already-loaded object exposing
+    `__call__(list_of_str) -> {"input_ids": ...}` and `eos_token_id` — which
+    is how tests drive this without a network round trip or a 300 MB import.
+    """
+    name = tokenizer if isinstance(tokenizer, str) else getattr(
+        tokenizer, "name_or_path", "custom")
+    out = token_cache_path(n_shards, data_dir, name)
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        n = os.path.getsize(out) // 2
+        print(f"[data] cache hit: {out} ({n} tokens, {n / 1e9:.2f}B)",
+              flush=True)
+        return out
+    import pyarrow.parquet as pq
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    tmp, prog = out + ".partial", out + ".progress"
+    names = shard_names(n_shards, repo_id, subdir)
+    if isinstance(tokenizer, str):
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(tokenizer)
+    else:
+        tok = tokenizer
+    eos = tok.eos_token_id
+    assert eos is not None, f"{name} has no eos_token_id to separate docs"
+
+    done, total, ndocs = 0, 0, 0
+    if os.path.exists(prog) and os.path.exists(tmp):
+        st = json.load(open(prog))
+        if st.get("names") == names and st.get("tokenizer") == name:
+            done, total, ndocs = st["shards"], st["tokens"], st["docs"]
+            with open(tmp, "r+b") as f:          # drop a half-written shard
+                f.truncate(total * 2)
+            print(f"[data] resuming at shard {done}/{len(names)} "
+                  f"({total / 1e9:.2f}B tokens already written)", flush=True)
+        else:
+            os.remove(prog)
+    print(f"[data] building {out} from {len(names)} shard(s) of {subdir} "
+          f"with {name}", flush=True)
+    t0 = time.time()
+    reported = total
+    with open(tmp, "r+b" if done else "wb", buffering=1 << 22) as f:
+        f.seek(total * 2)
+        for si, name in enumerate(names):
+            if si < done:
+                continue
+            path = _fetch(name, repo_id)
+            pf = pq.ParquetFile(path)
+            for rb in pf.iter_batches(batch_size=doc_batch, columns=["text"]):
+                texts = [t for t in rb.column("text").to_pylist() if t]
+                if not texts:
+                    continue
+                ids = tok(texts, add_special_tokens=False)["input_ids"]
+                arr = np.concatenate(
+                    [np.asarray(d + [eos], dtype=np.int64) for d in ids])
+                hi = int(arr.max())
+                assert hi < 65536, (
+                    f"token id {hi} does not fit uint16; {tokenizer} is too "
+                    f"large for this cache format")
+                f.write(arr.astype(np.uint16).tobytes())
+                total += int(arr.size)
+                ndocs += len(texts)
+                if total - reported > (1 << 27):    # every ~134M tokens
+                    reported = total
+                    print(f"[data]   {total / 1e9:.3f}B tokens, {ndocs} docs, "
+                          f"{time.time() - t0:.0f}s", flush=True)
+            f.flush()
+            json.dump({"names": names, "tokenizer": name, "shards": si + 1,
+                       "tokens": total, "docs": ndocs}, open(prog, "w"))
+    if total == 0:
+        os.remove(tmp)
+        raise RuntimeError("no tokens written -- parquet had no 'text' column?")
+    os.replace(tmp, out)
+    if os.path.exists(prog):
+        os.remove(prog)
+    print(f"[data] wrote {out}: {total} tokens ({total / 1e9:.3f}B, "
+          f"{total * 2 / 1e9:.2f} GB) from {ndocs} docs in "
+          f"{time.time() - t0:.0f}s", flush=True)
+    return out
+
+
 # ---------------------------------------------------------------- induction
-def induction_mask_np(b, window, n=8):
-    """b: (T,) uint8 array. True at positions whose length-n context last
-    occurred more than `window` bytes earlier -- the recall-dependent slice.
+def induction_mask_np(b, window, n=IND_NGRAM_BYTES, bits=8):
+    """b: (T,) integer array. True at positions whose length-n context last
+    occurred more than `window` symbols earlier -- the recall-dependent slice.
+
+    `bits` is the width of one symbol: 8 for bytes, 16 for uint16 subword ids.
+    n*bits must fit the uint64 key, so n <= 8 for bytes and n <= 4 for tokens.
+    A symbol wider than `bits` raises rather than silently wrapping, which is
+    what an unchecked uint8 cast used to do to token ids.
 
     Vectorized equivalent of the per-position dict loop this replaced (see
-    tests/test_data.py, which checks them byte-for-byte): pack each n-gram
+    tests/test_data.py, which checks them symbol-for-symbol): pack each n-gram
     into an exact uint64 key, stable-argsort so equal keys form runs in
     ascending position order, and read each position's nearest earlier
     occurrence off its predecessor in that run.
     """
-    if n > 8:
-        raise ValueError("n-gram longer than 8 bytes does not fit a uint64 key")
-    T = int(b.shape[0])
+    if n * bits > 64:
+        raise ValueError(f"{n} symbols x {bits} bits exceeds a uint64 key")
+    a = np.asarray(b)
+    T = int(a.shape[0])
+    # checked before the short-sequence early return, so the contract holds
+    # whatever the length: a symbol too wide for `bits` is always an error
+    if T and int(a.max()) >= (1 << bits):
+        raise ValueError(f"symbol {int(a.max())} does not fit {bits} bits")
     mask = np.zeros(T, dtype=bool)
     m = T - n + 1                      # one key per position n-1 .. T-1
     if m <= 0:
         return mask
-    b64 = np.asarray(b, dtype=np.uint8).astype(np.uint64)
+    b64 = a.astype(np.uint64)
     keys = np.zeros(m, dtype=np.uint64)
     for i in range(n):
-        keys = (keys << np.uint64(8)) | b64[i:i + m]
+        keys = (keys << np.uint64(bits)) | b64[i:i + m]
     order = np.argsort(keys, kind="stable")
     same = np.empty(m, dtype=bool)
     same[0] = False
@@ -179,29 +322,33 @@ def induction_mask_np(b, window, n=8):
     return mask
 
 
-def induction_mask_batch(arr, window, n=8):
-    """arr: (B, T) uint8 array -> (B, T) bool array."""
-    return np.stack([induction_mask_np(arr[i], window, n)
+def induction_mask_batch(arr, window, n=IND_NGRAM_BYTES, bits=8):
+    """arr: (B, T) integer array -> (B, T) bool array."""
+    return np.stack([induction_mask_np(arr[i], window, n, bits)
                      for i in range(arr.shape[0])])
 
 
-def induction_mask(chunk, window, n=8):
-    """chunk: (T,) byte-valued tensor -> (T,) bool tensor."""
-    b = chunk.detach().to("cpu").numpy().astype(np.uint8)
-    return torch.from_numpy(induction_mask_np(b, window, n))
+def induction_mask(chunk, window, n=IND_NGRAM_BYTES, bits=8):
+    """chunk: (T,) integer tensor -> (T,) bool tensor."""
+    b = chunk.detach().to("cpu").numpy()
+    return torch.from_numpy(induction_mask_np(b, window, n, bits))
 
 
 # ---------------------------------------------------------------- sampler
-class ByteData:
-    """Seeded random contiguous windows over the flat uint8 byte file.
+class PackedData:
+    """Seeded random contiguous windows over a flat symbol file.
 
     The last `eval_frac` of the file is reserved for eval; train windows lie
-    entirely in the head, so the two splits share no bytes.
+    entirely in the head, so the two splits share no symbols.
     """
+
+    dtype = np.uint8
+    bits = 8
+    ngram = IND_NGRAM_BYTES
 
     def __init__(self, path, eval_frac=EVAL_FRAC):
         self.path = path
-        self.arr = np.memmap(path, dtype=np.uint8, mode="r")
+        self.arr = np.memmap(path, dtype=self.dtype, mode="r")
         self.n = int(self.arr.shape[0])
         self.n_train = int(self.n * (1.0 - eval_frac))
 
@@ -215,51 +362,85 @@ class ByteData:
     def window_at(self, start, T):
         return np.asarray(self.arr[start:start + T])
 
+    def _to_device(self, buf, device):
+        # torch has no from_numpy path for uint16, and the widening is 262 KB
+        # per batch at B=16, T=4096 -- nothing next to the step it feeds. The
+        # uint8 branch keeps the byte path shipping one byte per symbol.
+        if buf.dtype == np.uint8:
+            return torch.from_numpy(buf).to(device).long()
+        return torch.from_numpy(buf.astype(np.int32)).to(device).long()
+
     def batches(self, B, T, window, device, seed=0, split="train",
-                with_masks=False):
+                with_masks=False, ngram=None):
         """Yields (idx (B,T+1) long on device, ind_mask (B,T) bool or None)."""
         lo, hi = self.bounds(split)
         last = hi - (T + 1)
         if last < lo:
             raise RuntimeError(
-                f"{split} split of {self.path} holds {hi - lo} bytes, too few "
-                f"for a {T + 1}-byte window (build more shards)")
+                f"{split} split of {self.path} holds {hi - lo} symbols, too "
+                f"few for a {T + 1}-symbol window (build more shards)")
+        n = self.ngram if ngram is None else ngram
         rng = np.random.default_rng(seed)
-        buf = np.empty((B, T + 1), dtype=np.uint8)
+        buf = np.empty((B, T + 1), dtype=self.dtype)
         while True:
             starts = rng.integers(lo, last, size=B, endpoint=True)
             for i, s in enumerate(starts):
                 buf[i] = self.arr[s:s + T + 1]
-            # ship the bytes, widen on the far side (8x less PCIe traffic)
-            idx = torch.from_numpy(buf).to(device).long()
+            idx = self._to_device(buf, device)
             masks = None
             if with_masks:
                 masks = torch.from_numpy(
-                    induction_mask_batch(buf[:, :-1], window)).to(device)
+                    induction_mask_batch(buf[:, :-1], window, n,
+                                         self.bits)).to(device)
             yield idx, masks
+
+
+class ByteData(PackedData):
+    """uint8 utf-8 bytes, 0x00 document separator (`sample/10BT`)."""
+
+
+class TokenData(PackedData):
+    """uint16 GPT-NeoX subword ids, `<|endoftext|>` separator
+    (`sample/100BT`)."""
+
+    dtype = np.uint16
+    bits = 16
+    ngram = IND_NGRAM_TOKENS
+
+
+def open_data(tokens, n_shards=DEFAULT_SHARDS, data_dir=None):
+    """The cache for the corpus `tokens` selects, building it if needed."""
+    if tokens:
+        return TokenData(build_token_cache(n_shards, data_dir))
+    return ByteData(build_byte_cache(n_shards, data_dir))
 
 
 # ---------------------------------------------------------------- cli
 def main():
     ap = argparse.ArgumentParser(
-        description="build and sanity-check the local FineWeb-Edu byte cache")
+        description="build and sanity-check the local FineWeb-Edu cache")
+    ap.add_argument("--mode", choices=("bytes", "tokens"), default="bytes")
     ap.add_argument("--shards", type=int, default=DEFAULT_SHARDS,
-                    help="parquet shards to download (3.47 GB of bytes each)")
+                    help="parquet shards to download; a sample/10BT shard is "
+                         "3.47 GB of bytes, or ~0.75B NeoX tokens")
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--seq-len", type=int, default=512)
     args = ap.parse_args()
 
-    path = build_byte_cache(args.shards, args.data_dir)
-    d = ByteData(path)
-    print(f"[data] {path}: {d.n} bytes ({d.n / 1e9:.3f} GB); "
+    tokens = args.mode == "tokens"
+    d = open_data(tokens, args.shards, args.data_dir)
+    unit = "tokens" if tokens else "bytes"
+    print(f"[data] {d.path}: {d.n} {unit} ({d.n / 1e9:.3f}B); "
           f"train [0, {d.n_train}), eval [{d.n_train}, {d.n})")
 
+    cls = type(d)
+
     def first(split):
-        return next(ByteData(path).batches(args.batch, args.seq_len, 256,
-                                           "cpu", seed=args.seed,
-                                           split=split))[0]
+        return next(cls(d.path).batches(args.batch, args.seq_len, 256,
+                                        "cpu", seed=args.seed,
+                                        split=split))[0]
 
     a, b = first("train"), first("train")
     print(f"[data] determinism (train, seed={args.seed}): "
@@ -267,9 +448,14 @@ def main():
     e1, e2 = first("eval"), first("eval")
     print(f"[data] determinism (eval,  seed={args.seed}): "
           f"{'IDENTICAL' if torch.equal(e1, e2) else 'MISMATCH'}")
-    sample = bytes(a[0, :200].to(torch.uint8).numpy())
-    print("[data] first 200 bytes of a training sample:")
-    print(repr(sample.decode("utf-8", "replace")))
+    print(f"[data] first 200 {unit} of a training sample:")
+    if tokens:
+        from transformers import AutoTokenizer
+        tk = AutoTokenizer.from_pretrained(TOKENIZER)
+        print(repr(tk.decode(a[0, :200].tolist())))
+    else:
+        print(repr(bytes(a[0, :200].to(torch.uint8).numpy())
+                   .decode("utf-8", "replace")))
 
 
 if __name__ == "__main__":

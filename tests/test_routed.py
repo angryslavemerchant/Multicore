@@ -260,6 +260,95 @@ def test_param_matched_control():
           f"unfold+freerate FLOPs unchanged")
 
 
+def test_modern_recipe():
+    """RMSNorm + SwiGLU + qk-norm + tied embeddings, on BOTH arms.
+
+    The gate that matters is prefill == decode: the recipe touches four places
+    where the packed training path and the single-token decode path are
+    written separately (`_ln` / `_ln_one`, `_ffn` / the step_one FFN,
+    SWAttention.forward / .step), and a norm applied in one and not the other
+    is invisible in a loss curve — it only shows up as a model that trains
+    fine and generates garbage.
+    """
+    from dataclasses import replace
+    base = routed_cfg()
+    cfg = replace(base, rmsnorm=True, swiglu=True, qk_norm=True,
+                  tie_embeddings=True)
+    err, model = _prefill_decode_err(cfg, 15)
+    assert err < 3e-6, err
+    exp = model.cores[0].expert
+    assert exp.rmsnorm and exp.swiglu
+    assert not hasattr(exp, "ln1_b"), "RMSNorm must not carry a bias"
+    assert hasattr(exp, "f3_w"), "SwiGLU needs the gate projection"
+    assert model.blocks[0].attn.q_norm.weight.shape == (48 // 4,)
+    assert model.head.weight is model.tok_emb.weight, "embeddings not tied"
+
+    # tying is a real saving, and parameters() must not double-count the
+    # shared tensor
+    plain = SWTransformer(base)
+    tied_only = SWTransformer(replace(base, tie_embeddings=True))
+    saved = plain.num_params() - tied_only.num_params()
+    assert saved == 37 * 48, saved
+
+    # flipping swiglu alone must not move the parameter budget much: the 2/3
+    # width rule is what keeps it a nonlinearity change rather than a size one
+    from core.base_model import ffn_hidden
+    assert ffn_hidden(48, 4, swiglu=False) == 192
+    assert ffn_hidden(48, 4, swiglu=True) == 128         # 2/3 of 192
+    assert ffn_hidden(48, 4, swiglu=True, explicit=64) == 64
+    # at a real width: 4*384 -> 1536, and 2/3 of that is exactly 1024, so the
+    # multiple-of-8 rounding costs nothing. (At toy widths the rounding
+    # dominates — 2/3 of 256 is 170.7, rounded to 176, a 3% jump — which is
+    # why this is checked at a width the presets actually use.)
+    dense = ModelConfig(vocab_size=37, d_model=384, n_layers=2, n_heads=6,
+                        window=8, max_seq_len=32, core_layer=0, cores=[])
+    a = SWTransformer(dense).num_params()
+    b = SWTransformer(replace(dense, swiglu=True)).num_params()
+    assert abs(b - a) / a < 0.005, (a, b)
+    print(f"RT-RECIPE PASSED: prefill == decode ({err:.2e}); rmsnorm biasless, "
+          f"swiglu gated, qk-norm per-head, tying saved {saved:,} params "
+          f"({(b - a) / a:+.2%} FFN drift)")
+
+
+def test_flops_accounting():
+    """keys_per_token, the embedding lookup, and the LM head."""
+    from core.base_model import keys_per_token
+    from scripts.m5_arch import presets, flops_per_token
+    T = 4096
+    # causal full attention averages (T+1)/2 keys, not T
+    assert keys_per_token(T, T) == (T + 1) / 2
+    assert keys_per_token(10 ** 9, T) == (T + 1) / 2
+    # a sliding window is the window itself, less the causal ramp over the
+    # first `window` positions (248.03 at window 256, T 4096)
+    assert 0.96 * 256 < keys_per_token(256, T) < 256
+    assert keys_per_token(1, T) == 1.0
+
+    P = presets(T)
+    cfg = P["ref_dense_130m"]
+    model = SWTransformer(cfg)
+    f = flops_per_token(model, cfg, T)
+    body = model.num_params() - model.tok_emb.weight.numel()
+    head = 2 * cfg.d_model * cfg.vocab_size
+    attn = cfg.n_layers * 4 * cfg.d_model * keys_per_token(cfg.window, T)
+    assert abs(f - (2 * body + head + attn)) < 1.0, f
+
+    # Tying moves V*d parameters and ZERO FLOPs — the head matmul runs either
+    # way, and the lookup is free either way. If those two numbers do not come
+    # out equal, the table is being billed as arithmetic somewhere.
+    from dataclasses import replace
+    ucfg = replace(cfg, tie_embeddings=False)
+    untied = SWTransformer(ucfg)
+    fu = flops_per_token(untied, ucfg, T)
+    assert abs(fu - f) < 1.0, (f, fu)
+    assert untied.num_params() - model.num_params() == cfg.vocab_size * cfg.d_model
+    # and the naive "2 * every parameter" over-counts by exactly one head
+    assert abs((2 * untied.num_params() + attn) - (fu + head)) < 1.0
+    assert model.num_params() < 130e6 and body > 99e6, (model.num_params(), body)
+    print(f"RT-FLOPS-ACCT PASSED: ref_dense_130m {model.num_params()/1e6:.1f}M "
+          f"params ({body/1e6:.1f}M non-embedding), {f/1e6:.1f}M FLOPs/token "
+          f"= body {2*body/1e6:.1f} + head {head/1e6:.1f} + attn {attn/1e6:.1f}")
+
+
 if __name__ == "__main__":
     test_top1_exact_and_gradients()
     test_top1_prefill_decode()
@@ -270,4 +359,6 @@ if __name__ == "__main__":
     test_multik_compute()
     test_bounded_learned_rates()
     test_param_matched_control()
+    test_modern_recipe()
+    test_flops_accounting()
     print("ALL ROUTED GATES PASSED")
