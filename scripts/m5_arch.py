@@ -80,6 +80,21 @@ def presets(T):
         "smoke_cores_top1_loopmix": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
             max_seq_len=T, core_layer=4, cores=[routed] * 8),
+        # ---- ablations of smoke_cores_top1_loopmix (compare to IT, not to
+        # dense_local: only the unfold variant stays FLOPs-matched) ----
+        # (1) no cross-core mixing: experts never exchange information and
+        # rerouting sees an unmixed state. Drops 4.72M FLOPs/token (-10.8%).
+        "smoke_cores_top1_nomix": ModelConfig(
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4,
+            cores=[replace(routed, inter_core_window=0)] * 8),
+        # (2) unfolded recurrence: 3 independent expert weight sets instead of
+        # one applied 3x. IDENTICAL FLOPs, 3x the expert parameters — tests
+        # whether weight tying was costing anything.
+        "smoke_cores_top1_unfold": ModelConfig(
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4,
+            cores=[replace(routed, tie_loops=False)] * 8),
 
         # ---- rate sweep: SAME conditional FLOPs (rate x core params fixed),
         # trading sparsity against how much data each core param sees.

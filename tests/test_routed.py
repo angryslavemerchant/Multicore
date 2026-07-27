@@ -78,8 +78,68 @@ def test_top1_compute_match():
     print(f"RT-FLOPS PASSED: routed {rf:,} vs dense {df:,} ({rel:.3%})")
 
 
+def _prefill_decode_err(cfg, seed):
+    torch.manual_seed(seed)
+    model = SWTransformer(cfg).eval()
+    idx = torch.randint(0, 37, (3, 31))
+    with torch.no_grad():
+        full = model(idx)
+        cache = model.init_caches(3, "cpu")
+        step = torch.stack([model.forward_step(idx[:, t], cache)
+                            for t in range(idx.shape[1])], 1)
+    return float((full - step).abs().max()), model
+
+
+def test_ablation_nomix():
+    """inter_core_window=0 removes the mixer's params, FLOPs and cache."""
+    from dataclasses import replace
+    base = routed_cfg()
+    cfg = replace(base, cores=[replace(base.cores[0], inter_core_window=0)] * 4)
+    err, model = _prefill_decode_err(cfg, 12)
+    assert err < 3e-6, err
+    routed = model.cores[0]
+    assert not routed.use_mixer
+    # the module must be GONE, not merely unused — otherwise its parameters
+    # still get gradient and the "removed" FLOPs are still spent.
+    assert not hasattr(routed, "mixer") and not hasattr(routed, "mix_scale")
+    assert routed.estimated_flops_parts(2048)[1] == 0
+    full = SWTransformer(routed_cfg())
+    assert model.num_params() < full.num_params()
+    print(f"RT-NOMIX PASSED: prefill == decode ({err:.2e}); mixer absent, "
+          f"{full.num_params() - model.num_params():,} params dropped")
+
+
+def test_ablation_unfold():
+    """tie_loops=False gives each depth its own expert weights, same FLOPs."""
+    from dataclasses import replace
+    base = routed_cfg()
+    cfg = replace(base, cores=[replace(base.cores[0], tie_loops=False)] * 4)
+    err, model = _prefill_decode_err(cfg, 13)
+    assert err < 3e-6, err          # catches a _slice mismatch packed vs step
+    routed, tied = model.cores[0], SWTransformer(routed_cfg()).cores[0]
+    L, M = base.cores[0].n_loops, 4
+    assert routed.expert.n_sets == L and routed.expert.q_w.shape[0] == L * M
+    assert routed.estimated_flops_parts(2048) == tied.estimated_flops_parts(2048)
+    assert model.num_params() > SWTransformer(routed_cfg()).num_params()
+
+    # every depth's weights must receive their OWN gradient: if _slice were
+    # constant the later blocks would be dead parameters.
+    idx = torch.randint(0, 37, (4, 24))
+    logits, aux = model(idx, collect_aux=True)
+    (F.cross_entropy(logits.reshape(-1, 37), idx.reshape(-1))
+     + aux[0]["router_aux_loss"]).backward()
+    g = routed.expert.q_w.grad.reshape(L, M, -1).norm(dim=(1, 2))
+    assert (g > 0).all(), g
+    # ...and they must be genuinely distinct blocks, not aliases of one set
+    assert not torch.allclose(routed.expert.q_w[:M], routed.expert.q_w[M:2 * M])
+    print(f"RT-UNFOLD PASSED: prefill == decode ({err:.2e}); {L} independent "
+          f"weight sets, per-depth grad norms {[round(float(x), 4) for x in g]}")
+
+
 if __name__ == "__main__":
     test_top1_exact_and_gradients()
     test_top1_prefill_decode()
     test_top1_compute_match()
+    test_ablation_nomix()
+    test_ablation_unfold()
     print("ALL ROUTED GATES PASSED")

@@ -19,6 +19,12 @@ class CoreConfig:
     learned_tau: bool = False
     routing: str = "threshold"  # "threshold" or "top1_recurrent"
     n_loops: int = 1             # recurrent applications for routed cores
+    # True: one set of expert Q/K/V/O + FFN weights reused at every loop depth
+    # (LayerNorm affine and residual scales stay per-depth either way).
+    # False: UNFOLD the recurrence — n_loops independent expert weight sets, so
+    # the stack is n_loops ordinary layers rather than one block applied
+    # n_loops times. Same FLOPs, n_loops x the expert parameters.
+    tie_loops: bool = True
     ffn_hidden: int = 0          # 0 -> ffn_mult * d_core
     inter_core_window: int = 0   # shared causal mixer window; 0 disables
     residual_scale_init: float = 0.1

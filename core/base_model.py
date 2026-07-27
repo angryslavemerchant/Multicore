@@ -167,9 +167,13 @@ class SWAttention(nn.Module):
 class _RoutedExpertBlock(nn.Module):
     """Eight independent transformer blocks, one selected per token.
 
-    Expensive weights are tied across recurrent loop depth. LayerNorm affine
-    parameters and residual scales are loop-specific, so the repeated block
-    can learn different roles without duplicating its QKV/O or FFN weights.
+    With `tie_loops` (the default) one set of expensive weights is reused at
+    every recurrent depth; LayerNorm affine parameters and residual scales are
+    loop-specific, so the repeated block can learn different roles without
+    duplicating its QKV/O or FFN weights. With `tie_loops=False` the recurrence
+    is UNFOLDED: `n_loops` independent weight sets are stored back-to-back on
+    the leading axis and depth `l` slices out its own, making the stack
+    n_loops ordinary layers at identical FLOPs.
     """
 
     def __init__(self, d: int, cfg: CoreConfig, M: int):
@@ -181,15 +185,21 @@ class _RoutedExpertBlock(nn.Module):
         hidden = cfg.ffn_hidden or cfg.ffn_mult * d
         assert d % cfg.n_heads == 0
         self.hidden = hidden
-        self.q_w, self.q_b = _stacked(M, d, d), nn.Parameter(torch.zeros(M, d))
-        self.k_w, self.k_b = _stacked(M, d, d), nn.Parameter(torch.zeros(M, d))
-        self.v_w, self.v_b = _stacked(M, d, d), nn.Parameter(torch.zeros(M, d))
-        self.o_w, self.o_b = _stacked(M, d, d), nn.Parameter(torch.zeros(M, d))
-        self.f1_w = _stacked(M, d, hidden)
-        self.f1_b = nn.Parameter(torch.zeros(M, hidden))
-        self.f2_w = _stacked(M, hidden, d)
-        self.f2_b = nn.Parameter(torch.zeros(M, d))
-        self.rel_bias = nn.Parameter(torch.zeros(M, cfg.n_heads, cfg.K))
+        # One weight set when tied, n_loops of them when unfolded. `_slice`
+        # below turns a depth index into the right block of the leading axis;
+        # when tied it is always slice(0, M), i.e. the whole tensor, so the
+        # tied path is bit-identical to the pre-unfold code.
+        self.n_sets = 1 if cfg.tie_loops else cfg.n_loops
+        S = self.n_sets * M
+        self.q_w, self.q_b = _stacked(S, d, d), nn.Parameter(torch.zeros(S, d))
+        self.k_w, self.k_b = _stacked(S, d, d), nn.Parameter(torch.zeros(S, d))
+        self.v_w, self.v_b = _stacked(S, d, d), nn.Parameter(torch.zeros(S, d))
+        self.o_w, self.o_b = _stacked(S, d, d), nn.Parameter(torch.zeros(S, d))
+        self.f1_w = _stacked(S, d, hidden)
+        self.f1_b = nn.Parameter(torch.zeros(S, hidden))
+        self.f2_w = _stacked(S, hidden, d)
+        self.f2_b = nn.Parameter(torch.zeros(S, d))
+        self.rel_bias = nn.Parameter(torch.zeros(S, cfg.n_heads, cfg.K))
         shape = (cfg.n_loops, M, d)
         self.ln1_w = nn.Parameter(torch.ones(shape))
         self.ln1_b = nn.Parameter(torch.zeros(shape))
@@ -207,21 +217,35 @@ class _RoutedExpertBlock(nn.Module):
         M, P, _ = x.shape
         return x.view(M, P, self.n_heads, self.d_head).permute(0, 2, 1, 3)
 
+    def _slice(self, loop):
+        """Leading-axis block holding depth `loop`'s weights (all M experts)."""
+        o = (loop % self.n_sets) * self.M
+        return slice(o, o + self.M)
+
     def forward_packed(self, x, valid, row, loop):
+        s = self._slice(loop)
         xn = self._ln(x, self.ln1_w[loop], self.ln1_b[loop])
-        q = self._heads(_bl(xn, self.q_w, self.q_b))
-        k = self._heads(_bl(xn, self.k_w, self.k_b))
-        v = self._heads(_bl(xn, self.v_w, self.v_b))
-        a = _banded_attend(q, k, v, valid, row, self.rel_bias,
+        q = self._heads(_bl(xn, self.q_w[s], self.q_b[s]))
+        k = self._heads(_bl(xn, self.k_w[s], self.k_b[s]))
+        v = self._heads(_bl(xn, self.v_w[s], self.v_b[s]))
+        a = _banded_attend(q, k, v, valid, row, self.rel_bias[s],
                            self.K, self.M)
         a = a.permute(0, 2, 1, 3).reshape(self.M, x.shape[1], self.d)
-        x = x + self.attn_scale[loop, :, None, None] * _bl(a, self.o_w, self.o_b)
+        x = x + self.attn_scale[loop, :, None, None] * _bl(a, self.o_w[s],
+                                                           self.o_b[s])
         xn = self._ln(x, self.ln2_w[loop], self.ln2_b[loop])
-        f = _bl(F.gelu(_bl(xn, self.f1_w, self.f1_b)), self.f2_w, self.f2_b)
+        f = _bl(F.gelu(_bl(xn, self.f1_w[s], self.f1_b[s])),
+                self.f2_w[s], self.f2_b[s])
         return x + self.ffn_scale[loop, :, None, None] * f
 
     def step_one(self, expert, loop, x, xkv, valid, query_rank, kv_rank):
-        """One expert slice: x (S,d), xkv (S,K,d) -> (S,d)."""
+        """One expert slice: x (S,d), xkv (S,K,d) -> (S,d).
+
+        `expert` indexes the per-depth LayerNorm affine and residual scales,
+        which are always (n_loops, M); `e` indexes the expensive weights,
+        which carry the extra depth blocks when the recurrence is unfolded.
+        """
+        e = self._slice(loop).start + expert
         w1, b1 = self.ln1_w[loop, expert], self.ln1_b[loop, expert]
         qn = F.layer_norm(x, (self.d,)) * w1 + b1
         kn = F.layer_norm(xkv, (self.d,)) * w1 + b1
@@ -230,20 +254,20 @@ class _RoutedExpertBlock(nn.Module):
             S, P, _ = z.shape
             return z.view(S, P, self.n_heads, self.d_head).transpose(1, 2)
 
-        q = heads((qn @ self.q_w[expert] + self.q_b[expert])[:, None, :])
-        k = heads(kn @ self.k_w[expert] + self.k_b[expert])
-        v = heads(kn @ self.v_w[expert] + self.v_b[expert])
+        q = heads((qn @ self.q_w[e] + self.q_b[e])[:, None, :])
+        k = heads(kn @ self.k_w[e] + self.k_b[e])
+        v = heads(kn @ self.v_w[e] + self.v_b[e])
         gap = (query_rank[:, None] - kv_rank).clamp(0, self.K - 1)
-        bias = self.rel_bias[expert][:, gap].permute(1, 0, 2)[:, :, None, :]
+        bias = self.rel_bias[e][:, gap].permute(1, 0, 2)[:, :, None, :]
         bias = bias.masked_fill(~valid[:, None, None, :], float("-inf"))
         a = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         a = a.transpose(1, 2).reshape(x.shape[0], self.d)
         x = x + self.attn_scale[loop, expert] * (
-            a @ self.o_w[expert] + self.o_b[expert])
+            a @ self.o_w[e] + self.o_b[e])
         w2, b2 = self.ln2_w[loop, expert], self.ln2_b[loop, expert]
         xn = F.layer_norm(x, (self.d,)) * w2 + b2
-        f = F.gelu(xn @ self.f1_w[expert] + self.f1_b[expert])
-        f = f @ self.f2_w[expert] + self.f2_b[expert]
+        f = F.gelu(xn @ self.f1_w[e] + self.f1_b[e])
+        f = f @ self.f2_w[e] + self.f2_b[e]
         return x + self.ffn_scale[loop, expert] * f
 
 
@@ -262,16 +286,23 @@ class Top1LoopedMultiCore(nn.Module):
         d = model_cfg.d_model
         assert cfg.d_core == d, "top1 recurrent cores require d_core == d_model"
         assert cfg.n_core_layers == 1, "top1 recurrent experts contain one tied block"
-        assert M > 1 and cfg.n_loops > 0 and cfg.inter_core_window > 0
+        assert M > 1 and cfg.n_loops > 0 and cfg.inter_core_window >= 0
         self.cfg, self.M, self.d = cfg, M, d
+        # inter_core_window == 0 removes the shared mixer entirely: experts
+        # then never exchange information and rerouting sees an unmixed state.
+        # The module is not built at all, so its parameters and FLOPs are gone
+        # rather than merely unused.
+        self.use_mixer = cfg.inter_core_window > 0
         self.router_w = nn.Parameter(torch.randn(M, d) * 0.02)
         with torch.no_grad():
             orthonormalize_rows_(self.router_w)
         self.expert = _RoutedExpertBlock(d, cfg, M)
-        self.mixer_ln = nn.ModuleList(nn.LayerNorm(d) for _ in range(cfg.n_loops))
-        self.mixer = SWAttention(model_cfg, window=cfg.inter_core_window)
-        self.mix_scale = nn.Parameter(torch.full(
-            (cfg.n_loops,), cfg.residual_scale_init))
+        if self.use_mixer:
+            self.mixer_ln = nn.ModuleList(
+                nn.LayerNorm(d) for _ in range(cfg.n_loops))
+            self.mixer = SWAttention(model_cfg, window=cfg.inter_core_window)
+            self.mix_scale = nn.Parameter(torch.full(
+                (cfg.n_loops,), cfg.residual_scale_init))
 
     def zero_out_(self):
         # Deliberately not zeroed: zeroing the outer path starves every expert
@@ -317,7 +348,8 @@ class Top1LoopedMultiCore(nn.Module):
             scattered = torch.zeros(B * T, d, device=x.device, dtype=x.dtype)
             scattered.index_add_(0, fl, delta.reshape(-1, d))
             x = x + scattered.view(B, T, d)
-            x = x + self.mix_scale[li] * self.mixer(self.mixer_ln[li](x))
+            if self.use_mixer:
+                x = x + self.mix_scale[li] * self.mixer(self.mixer_ln[li](x))
 
             load = hard.float().mean(dim=(0, 1))
             importance = probs.float().mean(dim=(0, 1))
@@ -383,15 +415,18 @@ class Top1LoopedMultiCore(nn.Module):
                     mi, li, x[bidx], cache["x"][li, mi, bidx], valid, rank,
                     cache["rank"][li, mi, bidx])
             x = out
-            mixed = self.mixer.step(self.mixer_ln[li](x)[:, None, :],
-                                    cache["mixer"][li], t)[:, 0, :]
-            x = x + self.mix_scale[li] * mixed
+            if self.use_mixer:
+                mixed = self.mixer.step(self.mixer_ln[li](x)[:, None, :],
+                                        cache["mixer"][li], t)[:, 0, :]
+                x = x + self.mix_scale[li] * mixed
         return x - entry
 
     def estimated_flops_parts(self, T=None):
         d, hidden, L = self.d, self.expert.hidden, self.cfg.n_loops
         expert_linear = 2 * (4 * d * d + 2 * d * hidden)
         expert_attention = 4 * self.cfg.K * d
+        if not self.use_mixer:
+            return (L * (expert_linear + expert_attention), 0)
         mixer_linear = 2 * 4 * d * d
         mixer_attention = 4 * min(self.cfg.inter_core_window, T or self.cfg.inter_core_window) * d
         return (L * (expert_linear + expert_attention),
