@@ -61,6 +61,12 @@ def presets(T):
     # module per list entry, so repeating the read-only config is fine)
     octo = CoreConfig(K=64, d_core=512, n_heads=8, ffn_mult=4,
                       n_core_layers=3, target_rate=1 / 8)
+    routed = CoreConfig(
+        K=64, d_core=384, n_heads=6, n_core_layers=1, ffn_mult=2,
+        routing="top1_recurrent", n_loops=3, ffn_hidden=704,
+        inter_core_window=256, residual_scale_init=0.1,
+        router_aux_weight=0.01, router_hash_scale=0.5)
+
     return {
         # ---- smoke scale (minutes per run) ----
         # base ~14M + cores ~2x21M -> ~57M params, ~62% in cores;
@@ -71,6 +77,10 @@ def presets(T):
         "smoke_cores_8x": ModelConfig(
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
             max_seq_len=T, core_layer=4, cores=[octo] * 8),
+        "smoke_cores_top1_loopmix": ModelConfig(
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4, cores=[routed] * 8),
+
         # ---- rate sweep: SAME conditional FLOPs (rate x core params fixed),
         # trading sparsity against how much data each core param sees.
         # rate 1/8 => a core param gets gradient from 12.5% of tokens; at a
@@ -142,6 +152,11 @@ def flops_per_token(model, cfg, T, rates=None):
     base_params = model.num_params() - core_params
     f = 2 * base_params
     f += cfg.n_layers * 2 * 2 * min(cfg.window, T) * cfg.d_model  # base attn
+    routed = [c for c in model.cores if getattr(c, "is_top1_routed", False)]
+    if routed:
+        assert len(routed) == 1 and len(model.cores) == 1
+        return f + routed[0].estimated_flops_per_token(T)
+
     i = 0
     for c, cc in zip(model.cores, cfg.cores):
         n = getattr(c, "M", 1)                     # cores inside this module
@@ -262,6 +277,15 @@ def core_diagnostics(model, auxes):
             off = ~torch.eye(k.shape[0], dtype=torch.bool, device=k.device)
             out["gate_cos_mean"] = float(c[off].mean())
             out["gate_cos_max"] = float(c[off].max())
+    routers = [c.router_w.detach().float() for c in raw.cores
+               if hasattr(c, "router_w")]
+    if routers:
+        r = torch.cat(routers, 0)
+        rn = r / r.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        rc = (rn @ rn.t()).abs()
+        off = ~torch.eye(r.shape[0], dtype=torch.bool, device=r.device)
+        out["router_cos_mean"] = float(rc[off].mean())
+        out["router_cos_max"] = float(rc[off].max())
 
     # ---- selection overlap: |m_i & m_j| / |m_i | m_j| over all pairs, as one
     # (n_cores, B*T) float matmul rather than a python loop over pairs.
@@ -272,6 +296,16 @@ def core_diagnostics(model, auxes):
         j = inter / (sz[:, None] + sz[None, :] - inter).clamp_min(1.0)
         off = ~torch.eye(ms.shape[0], dtype=torch.bool, device=ms.device)
         out["sel_jaccard_mean"] = float(j[off].mean())
+    for key in ("router_entropy", "router_margin", "pack_util", "pack_overhead",
+                "rate_min", "rate_max", "rate_cv"):
+        if key in auxes[0]:
+            out[key] = float(auxes[0][key])
+
+    if "loop_rates" in auxes[0]:
+        lr = auxes[0]["loop_rates"]
+        for li in range(lr.shape[0]):
+            for mi in range(lr.shape[1]):
+                out[f"loop{li}_core{mi}_rate"] = float(lr[li, mi])
     return out
 
 
@@ -294,6 +328,14 @@ def evaluate(model, eval_data, device, cfg=None, T=None):
                 if auxes and cfg is not None:
                     diag["flops_per_token_measured"] = \
                         flops_per_token_measured(model, cfg, T, auxes)
+                    raw = getattr(model, "_orig_mod", model)
+                    routed = [c for c in raw.cores if
+                              getattr(c, "is_top1_routed", False)]
+                    if routed and "pack_util" in diag:
+                        expert_f, mixer_f = routed[0].estimated_flops_parts(T)
+                        base_f = diag["flops_per_token_measured"] - expert_f - mixer_f
+                        diag["flops_per_token_padded"] = (
+                            base_f + mixer_f + expert_f * diag["pack_overhead"])
             ce = F.cross_entropy(logits.reshape(-1, 256).float(),
                                  idx[:, 1:].reshape(-1), reduction="none")
             tot += float(ce.sum()); tot_n += ce.numel()
@@ -456,8 +498,11 @@ def main():
         with torch.autocast(device, dtype=torch.bfloat16,
                             enabled=(device == "cuda")):
             logits, auxes = model(idx[:, :-1], collect_aux=True)
-            loss = F.cross_entropy(logits.reshape(-1, 256).float(),
-                                   idx[:, 1:].reshape(-1))
+            ce_loss = F.cross_entropy(logits.reshape(-1, 256).float(),
+                                      idx[:, 1:].reshape(-1))
+            router_aux_loss = sum((a.get("router_aux_loss", 0.0)
+                                   for a in auxes), start=0.0)
+            loss = ce_loss + router_aux_loss
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -467,6 +512,9 @@ def main():
         if it % args.eval_every == 0 or it == args.iters:
             m = evaluate(model, eval_data, device, cfg, T)
             m.update({"iter": it, "loss": float(loss.detach()),
+                      "ce_loss": float(ce_loss.detach()),
+                      "router_aux_loss": float(router_aux_loss.detach()) if
+                      torch.is_tensor(router_aux_loss) else float(router_aux_loss),
                       "tokens": it * args.batch * T,
                       "tok_per_s": it * args.batch * T / (time.time() - t0)})
             for ci, a in enumerate(auxes):

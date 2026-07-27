@@ -479,7 +479,7 @@ class Core(_CoreCompute):
                 "rank": torch.zeros(B, K, dtype=torch.long, device=device),
                 "count": torch.zeros(B, dtype=torch.long, device=device)}
 
-    def step(self, h, ring):
+    def step(self, h, ring, t=None):
         """h: (B, d) one token per batch element -> delta (B, d).
         Mutates ring. Stores the committed layer-l input states of each
         admitted token; a new admit runs the layer stack against them."""
@@ -533,7 +533,7 @@ class TokenAdapter(_CoreCompute):
     def init_ring(self, B, device, dtype=torch.float32):
         return {}
 
-    def step(self, h, ring):
+    def step(self, h, ring, t=None):
         s, m, g = self.gate(h)
         return self._solo(h) * (g * m.float())[:, None]
 
@@ -741,7 +741,7 @@ class MultiCore(nn.Module):
                 "rank": torch.zeros(M, B, K, dtype=torch.long, device=device),
                 "count": torch.zeros(M, B, dtype=torch.long, device=device)}
 
-    def step(self, h, ring):
+    def step(self, h, ring, t=None):
         """h (B,d) -> summed delta (B,d). Mutates ring. All cores gate on the
         SAME h (deltas sum), matching the forward path."""
         B, d = h.shape

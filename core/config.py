@@ -17,6 +17,13 @@ class CoreConfig:
     # quantile controller is off after a one-time init at target_rate), so the
     # measured rate is what the model WANTS. See core_module._tau_maintain_.
     learned_tau: bool = False
+    routing: str = "threshold"  # "threshold" or "top1_recurrent"
+    n_loops: int = 1             # recurrent applications for routed cores
+    ffn_hidden: int = 0          # 0 -> ffn_mult * d_core
+    inter_core_window: int = 0   # shared causal mixer window; 0 disables
+    residual_scale_init: float = 0.1
+    router_hash_scale: float = 0.0  # deterministic (position+loop)%M prior
+    router_aux_weight: float = 0.01
 
 
 @dataclass

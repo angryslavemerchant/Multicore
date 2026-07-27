@@ -28,7 +28,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ModelConfig, CoreConfig
-from .core_module import Core, MultiCore, TokenAdapter, orthonormalize_rows_
+from .core_module import (Core, MultiCore, TokenAdapter, orthonormalize_rows_,
+                          _banded_attend, _stacked, _bl)
+from .resident import pack_indices
 
 # Query-block size floor for banded attention. C = `window` is the natural
 # block (key window W = 2*window-1 — the least wasted work per query); the
@@ -112,11 +114,11 @@ def _sliding_window_attend(q, k, v, window, C):
 
 
 class SWAttention(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, window=None):
         super().__init__()
         self.n_heads = cfg.n_heads
         self.d_head = cfg.d_model // cfg.n_heads
-        self.window = cfg.window
+        self.window = cfg.window if window is None else window
         self.rope = cfg.rope
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
@@ -162,7 +164,248 @@ class SWAttention(nn.Module):
         return self.proj(out.transpose(1, 2).reshape(B, 1, C))
 
 
+class _RoutedExpertBlock(nn.Module):
+    """Eight independent transformer blocks, one selected per token.
+
+    Expensive weights are tied across recurrent loop depth. LayerNorm affine
+    parameters and residual scales are loop-specific, so the repeated block
+    can learn different roles without duplicating its QKV/O or FFN weights.
+    """
+
+    def __init__(self, d: int, cfg: CoreConfig, M: int):
+        super().__init__()
+        self.d, self.M, self.K = d, M, cfg.K
+        self.n_heads = cfg.n_heads
+        self.d_head = d // cfg.n_heads
+        self.n_loops = cfg.n_loops
+        hidden = cfg.ffn_hidden or cfg.ffn_mult * d
+        assert d % cfg.n_heads == 0
+        self.hidden = hidden
+        self.q_w, self.q_b = _stacked(M, d, d), nn.Parameter(torch.zeros(M, d))
+        self.k_w, self.k_b = _stacked(M, d, d), nn.Parameter(torch.zeros(M, d))
+        self.v_w, self.v_b = _stacked(M, d, d), nn.Parameter(torch.zeros(M, d))
+        self.o_w, self.o_b = _stacked(M, d, d), nn.Parameter(torch.zeros(M, d))
+        self.f1_w = _stacked(M, d, hidden)
+        self.f1_b = nn.Parameter(torch.zeros(M, hidden))
+        self.f2_w = _stacked(M, hidden, d)
+        self.f2_b = nn.Parameter(torch.zeros(M, d))
+        self.rel_bias = nn.Parameter(torch.zeros(M, cfg.n_heads, cfg.K))
+        shape = (cfg.n_loops, M, d)
+        self.ln1_w = nn.Parameter(torch.ones(shape))
+        self.ln1_b = nn.Parameter(torch.zeros(shape))
+        self.ln2_w = nn.Parameter(torch.ones(shape))
+        self.ln2_b = nn.Parameter(torch.zeros(shape))
+        scale = torch.full((cfg.n_loops, M), cfg.residual_scale_init)
+        self.attn_scale = nn.Parameter(scale.clone())
+        self.ffn_scale = nn.Parameter(scale.clone())
+
+    @staticmethod
+    def _ln(x, w, b):
+        return F.layer_norm(x, (x.shape[-1],)) * w[:, None, :] + b[:, None, :]
+
+    def _heads(self, x):
+        M, P, _ = x.shape
+        return x.view(M, P, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+
+    def forward_packed(self, x, valid, row, loop):
+        xn = self._ln(x, self.ln1_w[loop], self.ln1_b[loop])
+        q = self._heads(_bl(xn, self.q_w, self.q_b))
+        k = self._heads(_bl(xn, self.k_w, self.k_b))
+        v = self._heads(_bl(xn, self.v_w, self.v_b))
+        a = _banded_attend(q, k, v, valid, row, self.rel_bias,
+                           self.K, self.M)
+        a = a.permute(0, 2, 1, 3).reshape(self.M, x.shape[1], self.d)
+        x = x + self.attn_scale[loop, :, None, None] * _bl(a, self.o_w, self.o_b)
+        xn = self._ln(x, self.ln2_w[loop], self.ln2_b[loop])
+        f = _bl(F.gelu(_bl(xn, self.f1_w, self.f1_b)), self.f2_w, self.f2_b)
+        return x + self.ffn_scale[loop, :, None, None] * f
+
+    def step_one(self, expert, loop, x, xkv, valid, query_rank, kv_rank):
+        """One expert slice: x (S,d), xkv (S,K,d) -> (S,d)."""
+        w1, b1 = self.ln1_w[loop, expert], self.ln1_b[loop, expert]
+        qn = F.layer_norm(x, (self.d,)) * w1 + b1
+        kn = F.layer_norm(xkv, (self.d,)) * w1 + b1
+
+        def heads(z):
+            S, P, _ = z.shape
+            return z.view(S, P, self.n_heads, self.d_head).transpose(1, 2)
+
+        q = heads((qn @ self.q_w[expert] + self.q_b[expert])[:, None, :])
+        k = heads(kn @ self.k_w[expert] + self.k_b[expert])
+        v = heads(kn @ self.v_w[expert] + self.v_b[expert])
+        gap = (query_rank[:, None] - kv_rank).clamp(0, self.K - 1)
+        bias = self.rel_bias[expert][:, gap].permute(1, 0, 2)[:, :, None, :]
+        bias = bias.masked_fill(~valid[:, None, None, :], float("-inf"))
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+        a = a.transpose(1, 2).reshape(x.shape[0], self.d)
+        x = x + self.attn_scale[loop, expert] * (
+            a @ self.o_w[expert] + self.o_b[expert])
+        w2, b2 = self.ln2_w[loop, expert], self.ln2_b[loop, expert]
+        xn = F.layer_norm(x, (self.d,)) * w2 + b2
+        f = F.gelu(xn @ self.f1_w[expert] + self.f1_b[expert])
+        f = f @ self.f2_w[expert] + self.f2_b[expert]
+        return x + self.ffn_scale[loop, expert] * f
+
+
+class Top1LoopedMultiCore(nn.Module):
+    """Top-1 routed recurrent middle stack with inter-expert communication.
+
+    Every token executes exactly one of M expert blocks per loop. After each
+    loop, tokens return to sequence order and pass through one shared causal
+    sliding-window attention mixer, then route again from the updated state.
+    """
+
+    is_top1_routed = True
+
+    def __init__(self, model_cfg: ModelConfig, cfg: CoreConfig, M: int):
+        super().__init__()
+        d = model_cfg.d_model
+        assert cfg.d_core == d, "top1 recurrent cores require d_core == d_model"
+        assert cfg.n_core_layers == 1, "top1 recurrent experts contain one tied block"
+        assert M > 1 and cfg.n_loops > 0 and cfg.inter_core_window > 0
+        self.cfg, self.M, self.d = cfg, M, d
+        self.router_w = nn.Parameter(torch.randn(M, d) * 0.02)
+        with torch.no_grad():
+            orthonormalize_rows_(self.router_w)
+        self.expert = _RoutedExpertBlock(d, cfg, M)
+        self.mixer_ln = nn.ModuleList(nn.LayerNorm(d) for _ in range(cfg.n_loops))
+        self.mixer = SWAttention(model_cfg, window=cfg.inter_core_window)
+        self.mix_scale = nn.Parameter(torch.full(
+            (cfg.n_loops,), cfg.residual_scale_init))
+
+    def zero_out_(self):
+        # Deliberately not zeroed: zeroing the outer path starves every expert
+        # parameter of gradient at initialization. Small residual scales provide
+        # the stable near-identity start instead.
+        pass
+
+    def _route(self, x, positions=None, loop=0):
+        xn = F.layer_norm(x.float(), (self.d,))
+        rw = self.router_w.float()
+        rw = rw / rw.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        logits = torch.einsum("btd,md->btm", xn, rw)
+        if positions is not None and self.cfg.router_hash_scale:
+            preferred = (positions + loop) % self.M
+            prior = F.one_hot(preferred, self.M).to(logits.dtype)
+            logits = logits + self.cfg.router_hash_scale * prior
+        choice = logits.argmax(dim=-1)
+        probs = torch.softmax(logits, dim=-1).to(x.dtype)
+        hard = F.one_hot(choice, self.M).to(x.dtype)
+        straight_through = (hard - probs).detach() + probs
+        return probs, hard.bool(), straight_through
+
+    def forward(self, h, m_override=None):
+        if m_override is not None:
+            raise ValueError("gate_override is not defined for top-1 routing")
+        B, T, d = h.shape
+        entry, x = h, h
+        loop_masks, loads, balances, pack_utils, pack_overheads = [], [], [], [], []
+        entropies, margins = [], []
+        for li in range(self.cfg.n_loops):
+            pos = torch.arange(T, device=x.device)
+            probs, hard, route_weight = self._route(x, pos, li)
+            masks = hard.permute(2, 0, 1)               # (M,B,T)
+            flat, row, valid = pack_indices(masks)
+            P = flat.shape[1]
+            fl = flat.reshape(-1)
+            packed = x.reshape(B * T, d).index_select(0, fl).view(self.M, P, d)
+            updated = self.expert.forward_packed(packed, valid, row, li)
+            delta = updated - packed
+            selected_weight = route_weight.permute(2, 0, 1).reshape(
+                self.M, B * T).gather(1, flat)
+            delta = delta * (selected_weight * valid.to(x.dtype))[..., None]
+            scattered = torch.zeros(B * T, d, device=x.device, dtype=x.dtype)
+            scattered.index_add_(0, fl, delta.reshape(-1, d))
+            x = x + scattered.view(B, T, d)
+            x = x + self.mix_scale[li] * self.mixer(self.mixer_ln[li](x))
+
+            load = hard.float().mean(dim=(0, 1))
+            importance = probs.float().mean(dim=(0, 1))
+            balances.append(self.M * (load.detach() * importance).sum())
+            loop_masks.append(masks)
+            pack_utils.append(valid.float().mean())
+            pack_overheads.append(valid.float().mean().clamp_min(1e-9).reciprocal())
+            p32 = probs.float().clamp_min(1e-9)
+            loads.append(load.detach())
+            entropies.append(-(p32 * p32.log()).sum(-1).mean() / math.log(self.M))
+            top2 = probs.float().topk(2, dim=-1).values
+            margins.append((top2[..., 0] - top2[..., 1]).mean())
+
+        delta = x - entry
+        masks = torch.stack(loop_masks)                  # (L,M,B,T)
+        rates = masks.float().mean(dim=(0, 2, 3))
+        hr = h.float().square().mean().sqrt().detach()
+        dr = delta.float().square().mean().sqrt().detach()
+        aux = []
+        for mi in range(self.M):
+            aux.append({"rate": rates[mi].detach(), "tau": rates.new_zeros(()),
+                        "tau_z": rates.new_zeros(()), "m": masks[:, mi].detach(),
+                        "h_rms": hr, "delta_rms": dr, "delta_group": self.M})
+        aux[0].update({
+            "router_aux_loss": self.cfg.router_aux_weight * torch.stack(balances).mean(),
+            "router_entropy": torch.stack(entropies).mean().detach(),
+            "router_margin": torch.stack(margins).mean().detach(),
+            "pack_util": torch.stack(pack_utils).mean().detach(),
+            "pack_overhead": torch.stack(pack_overheads).mean().detach(),
+            "loop_rates": masks.float().mean(dim=(2, 3)).detach(),
+            "rate_min": rates.min().detach(), "rate_max": rates.max().detach(),
+            "rate_cv": (rates.std() / rates.mean().clamp_min(1e-9)).detach(),
+        })
+        return delta, aux
+
+    def init_ring(self, B, device, dtype=torch.float32):
+        L, M, K, d = self.cfg.n_loops, self.M, self.cfg.K, self.d
+        return {"x": torch.zeros(L, M, B, K, d, device=device, dtype=dtype),
+                "rank": torch.zeros(L, M, B, K, device=device, dtype=torch.long),
+                "count": torch.zeros(L, M, B, device=device, dtype=torch.long),
+                "mixer": [{"k": None, "v": None} for _ in range(L)]}
+
+    def step(self, h, cache, t=0):
+        entry, x = h, h
+        ar = torch.arange(self.cfg.K, device=h.device)
+        for li in range(self.cfg.n_loops):
+            pos = torch.tensor(t, device=x.device)
+            _, hard, _ = self._route(x[:, None, :], pos, li)
+            choice = hard[:, 0].long().argmax(-1)
+            out = x.clone()
+            for mi in range(self.M):
+                bidx = (choice == mi).nonzero(as_tuple=True)[0]
+                if bidx.numel() == 0:
+                    continue
+                pos = cache["count"][li, mi, bidx] % self.cfg.K
+                rank = cache["count"][li, mi, bidx].clone()
+                cache["x"][li, mi, bidx, pos] = x[bidx]
+                cache["rank"][li, mi, bidx, pos] = rank
+                cache["count"][li, mi, bidx] += 1
+                valid = ar[None, :] < cache["count"][li, mi, bidx, None].clamp(
+                    max=self.cfg.K)
+                out[bidx] = self.expert.step_one(
+                    mi, li, x[bidx], cache["x"][li, mi, bidx], valid, rank,
+                    cache["rank"][li, mi, bidx])
+            x = out
+            mixed = self.mixer.step(self.mixer_ln[li](x)[:, None, :],
+                                    cache["mixer"][li], t)[:, 0, :]
+            x = x + self.mix_scale[li] * mixed
+        return x - entry
+
+    def estimated_flops_parts(self, T=None):
+        d, hidden, L = self.d, self.expert.hidden, self.cfg.n_loops
+        expert_linear = 2 * (4 * d * d + 2 * d * hidden)
+        expert_attention = 4 * self.cfg.K * d
+        mixer_linear = 2 * 4 * d * d
+        mixer_attention = 4 * min(self.cfg.inter_core_window, T or self.cfg.inter_core_window) * d
+        return (L * (expert_linear + expert_attention),
+                L * (mixer_linear + mixer_attention))
+
+    def estimated_flops_per_token(self, T=None):
+        return sum(self.estimated_flops_parts(T))
+
+    @torch.no_grad()
+    def reproject_router(self):
+        orthonormalize_rows_(self.router_w)
 class Block(nn.Module):
+
+
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.ln1 = nn.LayerNorm(cfg.d_model)
@@ -192,13 +435,22 @@ class SWTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         cls = TokenAdapter if cfg.adapter else Core
+        self.top1_routed = (bool(cfg.cores) and
+                            cfg.cores[0].routing == "top1_recurrent")
+        if self.top1_routed:
+            assert not cfg.adapter and len(cfg.cores) > 1
+            assert all(c == cfg.cores[0] for c in cfg.cores)
         # Identical core configs (the common case: N copies of one CoreConfig)
         # are computed by a single batched MultiCore instead of N sequential
         # modules — same math, one set of kernel launches. Heterogeneous
         # configs keep the per-core path.
-        self.batched_cores = (not cfg.adapter and len(cfg.cores) > 1
-                              and all(c == cfg.cores[0] for c in cfg.cores))
-        if self.batched_cores:
+        self.batched_cores = (not self.top1_routed and not cfg.adapter and
+                              len(cfg.cores) > 1 and
+                              all(c == cfg.cores[0] for c in cfg.cores))
+        if self.top1_routed:
+            self.cores = nn.ModuleList(
+                [Top1LoopedMultiCore(cfg, cfg.cores[0], len(cfg.cores))])
+        elif self.batched_cores:
             self.cores = nn.ModuleList(
                 [MultiCore(cfg.d_model, cfg.cores[0], len(cfg.cores))])
         else:
@@ -258,6 +510,9 @@ class SWTransformer(nn.Module):
         Not applied at construction, so a run with the mechanism switched off
         (`m5_arch.py --no-ortho`) is bit-identical to the pre-mechanism code.
         """
+        for core in self.cores:
+            if hasattr(core, "reproject_router"):
+                core.reproject_router()
         ks = [c.k_dir for c in self.cores if hasattr(c, "k_dir")]
         if sum(1 if k.dim() == 1 else k.shape[0] for k in ks) < 2:
             return
@@ -294,7 +549,8 @@ class SWTransformer(nn.Module):
             h = blk.step(h, caches["blocks"][li], caches["t"])
             if li == self.cfg.core_layer and self.cores and self.cores_enabled:
                 for core, ring in zip(self.cores, caches["rings"]):
-                    h = h + core.step(h[:, 0, :], ring)[:, None, :]
+                    h = h + core.step(h[:, 0, :], ring,
+                                      caches["t"])[:, None, :]
         caches["t"] += 1
         return self.head(self.ln_f(h))[:, 0, :]
 

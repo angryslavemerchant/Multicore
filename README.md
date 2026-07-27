@@ -6,6 +6,9 @@ into a K-slot FIFO and let them attend privately — the model's only
 long-range channel, and (at scale) a home for conditional parameters.
 
 Full design, invariants, and milestones: [CORE_ROUTING_PLAN.md](CORE_ROUTING_PLAN.md).
+Current routed M5 experiment and handoff context:
+[ROUTED_CORE_NOTES.md](ROUTED_CORE_NOTES.md).
+
 
 ## Layout
 
