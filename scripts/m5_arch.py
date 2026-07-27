@@ -165,6 +165,39 @@ def presets(T):
             vocab_size=50304, d_model=512, n_layers=22, n_heads=8, window=T,
             max_seq_len=T, core_layer=11, cores=[], ffn_hidden=2256,
             rmsnorm=True, swiglu=True, qk_norm=True, tie_embeddings=True),
+        # THE CORE ARCHITECTURE, at the reference's compute. 4 full-attention
+        # prefix layers, 16 UNFOLDED top-1 routed layers of 8 experts each, 4
+        # suffix layers; K=128 expert FIFO, W=256 chronological mixer between
+        # depths, bounded learned traffic shares, tied NeoX head.
+        #
+        # core FFN 2152 is not a round number, it is the one that makes this
+        # 342.6M FLOPs/token against ref_dense_130m's 342.8M -- 0.06% apart. So
+        # the claim under test is exactly "6.0x the parameters at identical
+        # compute": 621.5M params, 595.7M non-embedding, 94% of them in cores.
+        #
+        # capacity 2.5 >= M * rate_hi = 8 * 0.30, so the cap never binds before
+        # the range penalty does (core/config.py). Without a cap this preset
+        # OOMs at initialisation, not in steady state -- the router collapse is
+        # transient but the memory spike is not survivable.
+        #
+        # Chinchilla for 595.7M non-embedding is ~11.9B tokens; at 1B it sits
+        # at 1.7 tokens/param and every expert is starved. Read a short run as
+        # a point on the loss-vs-compute curve against ref_dense_130m at the
+        # SAME budget (both are FLOPs-matched per token, so equal tokens is
+        # equal compute), never as a verdict on the architecture.
+        "cores_620m": ModelConfig(
+            vocab_size=50304, d_model=512, n_layers=8, n_heads=8, window=T,
+            max_seq_len=T, core_layer=3, ffn_hidden=2256,
+            rmsnorm=True, swiglu=True, qk_norm=True, tie_embeddings=True,
+            cores=[CoreConfig(
+                K=128, d_core=512, n_heads=8, n_core_layers=1,
+                ffn_hidden=2152, routing="top1_recurrent",
+                n_loops=16, tie_loops=False, inter_core_window=256,
+                residual_scale_init=0.1, router_bias=True,
+                hash_anneal_iters=2000, rate_lo=0.03, rate_hi=0.30,
+                router_range_weight=1.0, router_hash_scale=0.5,
+                capacity_factor=2.5)] * 8),
+
         # Cheap token-corpus smoke tests: same shapes as the byte smoke presets
         # so the pipeline (uint16 cache, chunked CE, 4-token induction) can be
         # exercised in minutes before anything is rented. The architecture to
