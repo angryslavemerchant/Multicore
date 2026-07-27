@@ -371,19 +371,24 @@ class _RoutedExpertBlock(nn.Module):
         return slice(o, o + self.M)
 
     def forward_packed(self, x, valid, row, loop):
+        rf = torch.profiler.record_function
         s = self._slice(loop)
-        xn = self._ln(x, loop, 1)
-        q = self._heads(_bl(xn, self.q_w[s], self.q_b[s]))
-        k = self._heads(_bl(xn, self.k_w[s], self.k_b[s]))
-        v = self._heads(_bl(xn, self.v_w[s], self.v_b[s]))
-        a = _banded_attend(q, k, v, valid, row,
-                           self.rel_bias[s] + self.k_gate[s],
-                           self.K, self.M)
-        a = a.permute(0, 2, 1, 3).reshape(self.M, x.shape[1], self.d)
-        x = x + self.attn_scale[loop, :, None, None] * _bl(a, self.o_w[s],
-                                                           self.o_b[s])
-        f = self._ffn(self._ln(x, loop, 2), s)
-        return x + self.ffn_scale[loop, :, None, None] * f
+        with rf("expert_norm_qkv"):
+            xn = self._ln(x, loop, 1)
+            q = self._heads(_bl(xn, self.q_w[s], self.q_b[s]))
+            k = self._heads(_bl(xn, self.k_w[s], self.k_b[s]))
+            v = self._heads(_bl(xn, self.v_w[s], self.v_b[s]))
+        with rf("expert_banded_attn"):
+            a = _banded_attend(q, k, v, valid, row,
+                               self.rel_bias[s] + self.k_gate[s],
+                               self.K, self.M)
+            a = a.permute(0, 2, 1, 3).reshape(self.M, x.shape[1], self.d)
+        with rf("expert_out_proj"):
+            x = x + self.attn_scale[loop, :, None, None] * _bl(a, self.o_w[s],
+                                                               self.o_b[s])
+        with rf("expert_ffn"):
+            f = self._ffn(self._ln(x, loop, 2), s)
+            return x + self.ffn_scale[loop, :, None, None] * f
 
     def step_one(self, expert, loop, x, xkv, valid, query_rank, kv_rank):
         """One expert slice: x (S,d), xkv (S,K,d) -> (S,d).
@@ -518,24 +523,38 @@ class Top1LoopedMultiCore(nn.Module):
         loop_masks, loads, balances, pack_utils, pack_overheads = [], [], [], [], []
         drops = []
         entropies, margins = [], []
+        # record_function regions are free when no profiler is attached (a
+        # context manager over a no-op) and are the only way to attribute CUDA
+        # time to a STAGE rather than to an operator: `aten::bmm` covers both
+        # the attention score/value products and the expert projections, so an
+        # operator-level table cannot separate them.
+        rf = torch.profiler.record_function
         for li in range(self.cfg.n_loops):
-            pos = torch.arange(T, device=x.device)
-            probs, hard, route_weight = self._route(x, pos, li)
-            masks = hard.permute(2, 0, 1)               # (M,B,T)
-            flat, row, valid = pack_indices(masks, self.cfg.capacity_factor)
-            P = flat.shape[1]
-            fl = flat.reshape(-1)
-            packed = x.reshape(B * T, d).index_select(0, fl).view(self.M, P, d)
-            updated = self.expert.forward_packed(packed, valid, row, li)
-            delta = updated - packed
-            selected_weight = route_weight.permute(2, 0, 1).reshape(
-                self.M, B * T).gather(1, flat)
-            delta = delta * (selected_weight * valid.to(x.dtype))[..., None]
-            scattered = torch.zeros(B * T, d, device=x.device, dtype=x.dtype)
-            scattered.index_add_(0, fl, delta.reshape(-1, d))
-            x = x + scattered.view(B, T, d)
+            with rf("route"):
+                pos = torch.arange(T, device=x.device)
+                probs, hard, route_weight = self._route(x, pos, li)
+                masks = hard.permute(2, 0, 1)           # (M,B,T)
+            with rf("pack_indices"):
+                flat, row, valid = pack_indices(masks, self.cfg.capacity_factor)
+                P = flat.shape[1]
+                fl = flat.reshape(-1)
+            with rf("gather"):
+                packed = x.reshape(B * T, d).index_select(0, fl) \
+                          .view(self.M, P, d)
+            with rf("expert_block"):
+                updated = self.expert.forward_packed(packed, valid, row, li)
+            with rf("scatter"):
+                delta = updated - packed
+                selected_weight = route_weight.permute(2, 0, 1).reshape(
+                    self.M, B * T).gather(1, flat)
+                delta = delta * (selected_weight * valid.to(x.dtype))[..., None]
+                scattered = torch.zeros(B * T, d, device=x.device,
+                                        dtype=x.dtype)
+                scattered.index_add_(0, fl, delta.reshape(-1, d))
+                x = x + scattered.view(B, T, d)
             if self.use_mixer:
-                x = x + self.mix_scale[li] * self.mixer(self.mixer_ln[li](x))
+                with rf("mixer"):
+                    x = x + self.mix_scale[li] * self.mixer(self.mixer_ln[li](x))
 
             load = hard.float().mean(dim=(0, 1))
             importance = probs.float().mean(dim=(0, 1))

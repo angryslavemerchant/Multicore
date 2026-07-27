@@ -183,6 +183,13 @@ def main():
     # cost is measured rather than argued about.
     ap.add_argument("--capacity", type=float, default=None,
                     help="override every core's capacity_factor")
+    ap.add_argument("--profile-accum", type=int, default=8,
+                    help="micro-steps inside the profiled region. >1 so the "
+                         "optimizer is amortised the way the real loop does; "
+                         "the first version profiled 1 against a real 64:1 "
+                         "and made AdamW look like a third of the step.")
+    ap.add_argument("--trace-out", default=None,
+                    help="export a chrome trace here")
     ap.add_argument("--profile", action="store_true",
                     help="torch.profiler one step and print the top CUDA ops. "
                          "Replaces guessing about where the routed overhead "
@@ -279,31 +286,78 @@ def main():
         m = rows[0]["micro"]
         say(f"\n--- profiling micro {m} (accum {rows[0]['accum']}) ---",
             flush=True)
-        from torch.profiler import profile, ProfilerActivity
+        from torch.profiler import profile, ProfilerActivity, record_function
+        # PROFILE_ACCUM micro-steps per optimizer step, not one. The previous
+        # version profiled a single micro-step against a real 64:1 accumulation
+        # ratio, which inflated the optimizer's share ~64x and made it look
+        # like the dominant cost. Fused AdamW too, matching the training loop.
+        pa = args.profile_accum
         model = SWTransformer(cfg).to(device)
         if args.compile:
-            model = torch.compile(model, dynamic=True if cfg.cores else None)
+            model = torch.compile(model, dynamic=dyn)
         raw = unwrap(model)
-        opt = torch.optim.AdamW(model.parameters(), lr=6e-4)
+        try:
+            opt = torch.optim.AdamW(model.parameters(), lr=6e-4,
+                                    fused=(device == "cuda"))
+        except (RuntimeError, ValueError):
+            opt = torch.optim.AdamW(model.parameters(), lr=6e-4)
         idx = torch.randint(0, cfg.vocab_size, (m, T + 1)).to(device)
+
+        def one_step(tag=False):
+            opt.zero_grad(set_to_none=True)
+            for _ in range(pa):
+                ctx = record_function("fwd") if tag else contextlib.nullcontext()
+                with ctx, torch.autocast(device, dtype=torch.bfloat16,
+                                         enabled=(device == "cuda")):
+                    ce, aux, _ = train_loss(model, raw.head.weight, idx,
+                                            ce_chunk)
+                ctx = record_function("bwd") if tag else contextlib.nullcontext()
+                with ctx:
+                    ((ce + aux) / pa).backward()
+            ctx = record_function("optimizer") if tag else contextlib.nullcontext()
+            with ctx:
+                opt.step()
+
         for _ in range(3):                      # compile + warm the allocator
-            opt.zero_grad(set_to_none=True)
-            with torch.autocast(device, dtype=torch.bfloat16,
-                                enabled=(device == "cuda")):
-                ce, aux, _ = train_loss(model, raw.head.weight, idx, ce_chunk)
-            (ce + aux).backward()
-            opt.step()
-        torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
-            opt.zero_grad(set_to_none=True)
-            with torch.autocast(device, dtype=torch.bfloat16,
-                                enabled=(device == "cuda")):
-                ce, aux, _ = train_loss(model, raw.head.weight, idx, ce_chunk)
-            (ce + aux).backward()
-            opt.step()
+            one_step()
+        acts = [ProfilerActivity.CPU]
+        if device == "cuda":
+            acts.append(ProfilerActivity.CUDA)
             torch.cuda.synchronize()
-        say(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=25),
+        with profile(activities=acts, record_shapes=True) as p:
+            one_step(tag=True)
+            if device == "cuda":
+                torch.cuda.synchronize()
+        ka = p.key_averages()
+        sort = ("self_cuda_time_total" if device == "cuda"
+                else "self_cpu_time_total")
+        # A record_function region is a CONTAINER: its SELF time is only the
+        # Python overhead, and the real time lands on the leaf aten ops inside
+        # it. So regions must be reported by TOTAL time and separately -- in a
+        # self-time table they simply never appear, which is why the first
+        # attempt at this showed no regions at all.
+        REGIONS = ("fwd", "bwd", "optimizer", "route", "pack_indices",
+                   "gather", "expert_block", "expert_norm_qkv",
+                   "expert_banded_attn", "expert_out_proj", "expert_ffn",
+                   "scatter", "mixer")
+        tot = "cuda_time_total" if device == "cuda" else "cpu_time_total"
+        say(f"\n== by REGION (accum {pa}: optimizer amortised {pa}:1) ==",
             flush=True)
+        say(f"{'region':<22}{'total ms':>11}{'calls':>8}{'ms/call':>10}",
+            flush=True)
+        for e in sorted([e for e in ka if e.key in REGIONS],
+                        key=lambda e: -getattr(e, tot)):
+            ms = getattr(e, tot) / 1000.0
+            say(f"{e.key:<22}{ms:>11.2f}{e.count:>8}"
+                f"{ms / max(e.count, 1):>10.3f}", flush=True)
+        say("\n== leaf operators ==", flush=True)
+        say(ka.table(sort_by=sort, row_limit=25), flush=True)
+        say("\n== dominant matmuls BY SHAPE ==", flush=True)
+        say(p.key_averages(group_by_input_shape=True).table(
+            sort_by=sort, row_limit=20), flush=True)
+        if args.trace_out:
+            p.export_chrome_trace(args.trace_out)
+            say(f"\nTRACE {args.trace_out}", flush=True)
 
     if not rows:
         sys.exit("no configuration ran")
