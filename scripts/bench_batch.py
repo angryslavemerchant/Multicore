@@ -180,6 +180,12 @@ def main():
     # cost is measured rather than argued about.
     ap.add_argument("--capacity", type=float, default=None,
                     help="override every core's capacity_factor")
+    ap.add_argument("--profile", action="store_true",
+                    help="torch.profiler one step and print the top CUDA ops. "
+                         "Replaces guessing about where the routed overhead "
+                         "goes -- three theories so far (micro-batch, padded "
+                         "GEMMs, banded attention) and only the second was "
+                         "even partly right.")
     ap.add_argument("--label", default="", help="tag for this row in the JSON")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -258,6 +264,36 @@ def main():
               f"{rows[-1]['hours']:5.2f} h for {args.total_tokens/1e9:.2f}B  "
               f"({'compiled' if cok else 'EAGER'}, warmup {cs:.0f}s)",
               flush=True)
+
+    if args.profile and rows:
+        m = rows[0]["micro"]
+        say(f"\n--- profiling micro {m} (accum {rows[0]['accum']}) ---",
+            flush=True)
+        from torch.profiler import profile, ProfilerActivity
+        model = SWTransformer(cfg).to(device)
+        if args.compile:
+            model = torch.compile(model, dynamic=True if cfg.cores else None)
+        raw = unwrap(model)
+        opt = torch.optim.AdamW(model.parameters(), lr=6e-4)
+        idx = torch.randint(0, cfg.vocab_size, (m, T + 1)).to(device)
+        for _ in range(3):                      # compile + warm the allocator
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(device, dtype=torch.bfloat16,
+                                enabled=(device == "cuda")):
+                ce, aux, _ = train_loss(model, raw.head.weight, idx, ce_chunk)
+            (ce + aux).backward()
+            opt.step()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(device, dtype=torch.bfloat16,
+                                enabled=(device == "cuda")):
+                ce, aux, _ = train_loss(model, raw.head.weight, idx, ce_chunk)
+            (ce + aux).backward()
+            opt.step()
+            torch.cuda.synchronize()
+        say(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=25),
+            flush=True)
 
     if not rows:
         sys.exit("no configuration ran")
