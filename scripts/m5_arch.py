@@ -106,6 +106,19 @@ def presets(T):
             max_seq_len=T, core_layer=4,
             cores=[replace(routed, K=128,
                            K_list=(16, 16, 32, 32, 64, 64, 128, 128))] * 8),
+        # (4) BOUNDED LEARNED RATES (ROUTED_CORE_NOTES.md, the item after
+        # heterogeneous FIFO). Traffic shares become learnable via a per-expert
+        # routing bias; the positional prior anneals away over 2000 steps; the
+        # exact-uniform Switch loss is replaced by a penalty that is EXACTLY
+        # zero while every expert sits in [3%, 30%]. Inside that band rates are
+        # free to differentiate — a 10x spread, i.e. horizons 213..2133 at
+        # K=64 — and only dead or dominant experts are pushed back.
+        "smoke_cores_top1_freerate": ModelConfig(
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4,
+            cores=[replace(routed, router_bias=True, hash_anneal_iters=2000,
+                           rate_lo=0.03, rate_hi=0.30,
+                           router_range_weight=1.0)] * 8),
 
         # ---- rate sweep: SAME conditional FLOPs (rate x core params fixed),
         # trading sparsity against how much data each core param sees.
@@ -326,6 +339,22 @@ def core_diagnostics(model, auxes):
                 "rate_min", "rate_max", "rate_cv"):
         if key in auxes[0]:
             out[key] = float(auxes[0][key])
+    # bounded-learned-rate mode: how far the per-expert routing bias has
+    # actually moved. A spread pinned near 0 means the rates never
+    # differentiated and the experiment is a null result, not a win.
+    # read straight off the module rather than through the aux dict: the
+    # forward runs under torch.compile and must not build host tensors
+    for c in raw.cores:
+        if getattr(c, "is_top1_routed", False) and c.cfg.hash_anneal_iters:
+            frac = max(0.0, 1.0 - int(c._step) / c.cfg.hash_anneal_iters)
+            out["hash_scale"] = c.cfg.router_hash_scale * frac
+    biases = [c.r_bias.detach().float() for c in raw.cores
+              if hasattr(c, "r_bias")]
+    if biases:
+        b = torch.cat(biases)
+        out["router_bias_min"] = float(b.min())
+        out["router_bias_max"] = float(b.max())
+        out["router_bias_spread"] = float(b.max() - b.min())
 
     if "loop_rates" in auxes[0]:
         lr = auxes[0]["loop_rates"]

@@ -313,6 +313,11 @@ class Top1LoopedMultiCore(nn.Module):
         self.router_w = nn.Parameter(torch.randn(M, d) * 0.02)
         with torch.no_grad():
             orthonormalize_rows_(self.router_w)
+        if cfg.router_bias:
+            self.r_bias = nn.Parameter(torch.zeros(M))
+        # Training-step counter for the hash anneal. Kept as a buffer and used
+        # as a tensor throughout, so reading it never forces a device sync.
+        self.register_buffer("_step", torch.zeros((), dtype=torch.long))
         self.expert = _RoutedExpertBlock(d, cfg, M)
         if self.use_mixer:
             self.mixer_ln = nn.ModuleList(
@@ -327,15 +332,44 @@ class Top1LoopedMultiCore(nn.Module):
         # the stable near-identity start instead.
         pass
 
+    def _hash_scale(self):
+        """Positional-prior strength, linearly annealed to 0 if configured.
+
+        Stays a tensor so no `.item()` sync creeps into the forward pass.
+        """
+        s = self.cfg.router_hash_scale
+        if not self.cfg.hash_anneal_iters:
+            return s
+        frac = 1.0 - self._step.float() / self.cfg.hash_anneal_iters
+        return s * frac.clamp_min(0.0)
+
+    def _balance_term(self, load, importance):
+        """Uniform Switch loss, or the bounded-band range penalty.
+
+        The range penalty is EXACTLY zero while every expert's share is inside
+        [rate_lo, rate_hi], so rates are free to differentiate; it only pushes
+        back on experts going dead or dominant. Gradient flows through
+        `importance` (the mean softmax mass), since the argmax load is not
+        differentiable.
+        """
+        if not self.cfg.router_bias:
+            return self.M * (load.detach() * importance).sum()
+        lo, hi = self.cfg.rate_lo, self.cfg.rate_hi
+        pen = (F.relu(lo - importance).pow(2)
+               + F.relu(importance - hi).pow(2)).sum()
+        return self.cfg.router_range_weight * pen
+
     def _route(self, x, positions=None, loop=0):
         xn = F.layer_norm(x.float(), (self.d,))
         rw = self.router_w.float()
         rw = rw / rw.norm(dim=1, keepdim=True).clamp_min(1e-12)
         logits = torch.einsum("btd,md->btm", xn, rw)
+        if self.cfg.router_bias:
+            logits = logits + self.r_bias.float()
         if positions is not None and self.cfg.router_hash_scale:
             preferred = (positions + loop) % self.M
             prior = F.one_hot(preferred, self.M).to(logits.dtype)
-            logits = logits + self.cfg.router_hash_scale * prior
+            logits = logits + self._hash_scale() * prior
         choice = logits.argmax(dim=-1)
         probs = torch.softmax(logits, dim=-1).to(x.dtype)
         hard = F.one_hot(choice, self.M).to(x.dtype)
@@ -346,6 +380,8 @@ class Top1LoopedMultiCore(nn.Module):
         if m_override is not None:
             raise ValueError("gate_override is not defined for top-1 routing")
         B, T, d = h.shape
+        if self.training:
+            self._step += 1
         entry, x = h, h
         loop_masks, loads, balances, pack_utils, pack_overheads = [], [], [], [], []
         entropies, margins = [], []
@@ -370,7 +406,7 @@ class Top1LoopedMultiCore(nn.Module):
 
             load = hard.float().mean(dim=(0, 1))
             importance = probs.float().mean(dim=(0, 1))
-            balances.append(self.M * (load.detach() * importance).sum())
+            balances.append(self._balance_term(load, importance))
             loop_masks.append(masks)
             pack_utils.append(valid.float().mean())
             pack_overheads.append(valid.float().mean().clamp_min(1e-9).reciprocal())
@@ -391,7 +427,12 @@ class Top1LoopedMultiCore(nn.Module):
                         "tau_z": rates.new_zeros(()), "m": masks[:, mi].detach(),
                         "h_rms": hr, "delta_rms": dr, "delta_group": self.M})
         aux[0].update({
-            "router_aux_loss": self.cfg.router_aux_weight * torch.stack(balances).mean(),
+            # the range penalty is already absolutely scaled; only the
+            # uniform Switch objective takes router_aux_weight
+            "router_aux_loss": (torch.stack(balances).mean() if
+                                self.cfg.router_bias else
+                                self.cfg.router_aux_weight
+                                * torch.stack(balances).mean()),
             "router_entropy": torch.stack(entropies).mean().detach(),
             "router_margin": torch.stack(margins).mean().detach(),
             "pack_util": torch.stack(pack_utils).mean().detach(),

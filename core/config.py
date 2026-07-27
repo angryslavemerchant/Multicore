@@ -33,6 +33,25 @@ class CoreConfig:
     # and masking each expert down to its own length, so the band kernel stays
     # single-width; costs the K_max attention term for everyone.
     K_list: tuple = ()
+    # BOUNDED LEARNED RATES (ROUTED_CORE_NOTES.md). Rates are free to differ,
+    # but only inside a safe band — the failure mode of unconstrained top-1 is
+    # collapse onto one or two experts, which starves the rest and destroys the
+    # max-count-padded kernel. Three pieces, all off by default:
+    #   router_bias        a learnable scalar per expert added to the routing
+    #                      logits. Router rows are re-orthonormalised to unit
+    #                      norm and x is layer-normed, which caps the learned
+    #                      logit spread near +-1 sigma; this bias is what
+    #                      actually lets traffic shares move.
+    #   hash_anneal_iters  linearly decay router_hash_scale to 0 over N steps,
+    #                      so the positional prior keeps experts alive early
+    #                      and then gets out of the way. 0 disables.
+    #   rate_lo/rate_hi    range penalty bounds. Exactly zero penalty while
+    #                      every expert is inside the band.
+    router_bias: bool = False
+    hash_anneal_iters: int = 0
+    rate_lo: float = 0.03
+    rate_hi: float = 0.30
+    router_range_weight: float = 1.0
     ffn_hidden: int = 0          # 0 -> ffn_mult * d_core
     inter_core_window: int = 0   # shared causal mixer window; 0 disables
     residual_scale_init: float = 0.1

@@ -191,6 +191,52 @@ def test_multik_compute():
           f"{out['smoke_cores_top1_loopmix']:,} baseline ({rel:+.3%})")
 
 
+def test_bounded_learned_rates():
+    """Range penalty is silent inside the band, bites outside; prior anneals."""
+    from dataclasses import replace
+    base = routed_cfg()
+    cfg = replace(base, cores=[replace(base.cores[0], router_bias=True,
+                                       hash_anneal_iters=10, rate_lo=0.10,
+                                       rate_hi=0.40,
+                                       router_hash_scale=0.5)] * 4)
+    torch.manual_seed(16)
+    model = SWTransformer(cfg)
+    core = model.cores[0]
+    assert core.r_bias.shape == (4,)
+
+    # penalty is EXACTLY zero on a balanced share vector, and positive once an
+    # expert goes dominant or dead
+    load = torch.full((4,), 0.25)
+    inside = core._balance_term(load, torch.tensor([0.25, 0.25, 0.25, 0.25]))
+    dom = core._balance_term(load, torch.tensor([0.85, 0.05, 0.05, 0.05]))
+    assert float(inside) == 0.0, float(inside)
+    assert float(dom) > 0.1, float(dom)
+
+    # the positional prior decays to exactly zero and stays there
+    scales = []
+    for s in (0, 5, 10, 25):
+        core._step.fill_(s)
+        scales.append(float(torch.as_tensor(core._hash_scale())))
+    assert scales[0] > scales[1] > scales[2] == 0.0 and scales[3] == 0.0, scales
+
+    # the bias must actually receive gradient — it is the only term that can
+    # move traffic, since router rows are renormalised to unit length
+    core._step.zero_()
+    model.train()
+    idx = torch.randint(0, 37, (4, 24))
+    logits, aux = model(idx, collect_aux=True)
+    (F.cross_entropy(logits.reshape(-1, 37), idx.reshape(-1))
+     + aux[0]["router_aux_loss"]).backward()
+    assert core.r_bias.grad is not None and float(core.r_bias.grad.abs().max()) > 0
+    assert int(core._step) == 1, int(core._step)   # counter advanced once
+    model.eval()
+    before = int(core._step)
+    model(idx)
+    assert int(core._step) == before               # frozen outside training
+    print(f"RT-FREERATE PASSED: penalty 0.0 inside band / {float(dom):.3f} on a "
+          f"dominant expert; prior anneals {scales[0]:.3f}->0; bias grad live")
+
+
 if __name__ == "__main__":
     test_top1_exact_and_gradients()
     test_top1_prefill_decode()
@@ -199,4 +245,5 @@ if __name__ == "__main__":
     test_ablation_unfold()
     test_heterogeneous_fifo()
     test_multik_compute()
+    test_bounded_learned_rates()
     print("ALL ROUTED GATES PASSED")
