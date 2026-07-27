@@ -57,6 +57,13 @@ class CoreConfig:
     rate_lo: float = 0.03
     rate_hi: float = 0.30
     router_range_weight: float = 1.0
+    # EXPERT CAPACITY, as a multiple of the fair share. 0 disables (the buffer
+    # is then sized by the busiest expert, which is what a collapsed router
+    # turns into an M-fold memory blowup). Must be >= M * rate_hi, or the cap
+    # binds before the range penalty does and the two mechanisms fight: the
+    # router is told it may take rate_hi of the traffic, then silently loses
+    # the tokens for doing so. At M=8, rate_hi=0.30 that floor is 2.4.
+    capacity_factor: float = 0.0
     ffn_hidden: int = 0          # 0 -> ffn_mult * d_core
     inter_core_window: int = 0   # shared causal mixer window; 0 disables
     residual_scale_init: float = 0.1

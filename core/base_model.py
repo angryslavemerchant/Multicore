@@ -516,12 +516,13 @@ class Top1LoopedMultiCore(nn.Module):
             self._step += 1
         entry, x = h, h
         loop_masks, loads, balances, pack_utils, pack_overheads = [], [], [], [], []
+        drops = []
         entropies, margins = [], []
         for li in range(self.cfg.n_loops):
             pos = torch.arange(T, device=x.device)
             probs, hard, route_weight = self._route(x, pos, li)
             masks = hard.permute(2, 0, 1)               # (M,B,T)
-            flat, row, valid = pack_indices(masks)
+            flat, row, valid = pack_indices(masks, self.cfg.capacity_factor)
             P = flat.shape[1]
             fl = flat.reshape(-1)
             packed = x.reshape(B * T, d).index_select(0, fl).view(self.M, P, d)
@@ -540,6 +541,10 @@ class Top1LoopedMultiCore(nn.Module):
             importance = probs.float().mean(dim=(0, 1))
             balances.append(self._balance_term(load, importance))
             loop_masks.append(masks)
+            # tokens routed here but over their expert's cap: they skip the
+            # expert entirely and ride the residual. Nonzero means the cap is
+            # binding, which is a fact about the router, not a free lunch.
+            drops.append(1.0 - valid.sum() / masks.sum().clamp_min(1))
             pack_utils.append(valid.float().mean())
             pack_overheads.append(valid.float().mean().clamp_min(1e-9).reciprocal())
             p32 = probs.float().clamp_min(1e-9)
@@ -569,6 +574,7 @@ class Top1LoopedMultiCore(nn.Module):
             "router_margin": torch.stack(margins).mean().detach(),
             "pack_util": torch.stack(pack_utils).mean().detach(),
             "pack_overhead": torch.stack(pack_overheads).mean().detach(),
+            "drop_rate": torch.stack(drops).mean().detach(),
             "loop_rates": masks.float().mean(dim=(2, 3)).detach(),
             "rate_min": rates.min().detach(), "rate_max": rates.max().detach(),
             "rate_cv": (rates.std() / rates.mean().clamp_min(1e-9)).detach(),

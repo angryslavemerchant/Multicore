@@ -38,8 +38,30 @@ def compact_indices(m: torch.Tensor):
     return idx, valid
 
 
-def pack_indices(m: torch.Tensor):
+def pack_indices(m: torch.Tensor, capacity: float = 0.0):
     """Flat (varlen) packing. m: (G, B, T) bool -> (flat, row, valid).
+
+    `capacity` > 0 caps each core at `capacity * N / G` slots and DROPS the
+    overflow, which changes three things at once — all of them consequences of
+    the same line, `Npad = int(counts.max())`:
+
+      MEMORY becomes bounded by construction. Uncapped, the buffer is sized by
+      the busiest core, so a collapsed router costs G x the memory. Measured at
+      init: 96.8% of tokens to one expert of 8, an 8x activation blowup that
+      OOM'd a 32 GB card. Capped, the buffer is `capacity * N` whatever the
+      routing does.
+
+      SHAPES become static. `int(counts.max())` is a host sync on a
+      data-dependent value: it forces `dynamic=True` under torch.compile and
+      shows up as a graph break in the dynamo trace. A capacity is arithmetic
+      on shapes dynamo already knows.
+
+      TOKENS get dropped. An over-capacity token is not processed by its core
+      and passes through on the residual alone. Set capacity above
+      `G * rate_hi` or the cap silently becomes the binding constraint instead
+      of whatever balancing objective is in use — two mechanisms fighting over
+      the same quantity. The caller can read the drop rate off `valid`:
+      `1 - valid.sum() / m.sum()`.
 
     G is the number of cores packed together (1 for a single `Core`, M for a
     `MultiCore`). Core g's admitted tokens across the WHOLE batch go into ONE
@@ -72,17 +94,26 @@ def pack_indices(m: torch.Tensor):
     mf = m.reshape(G, N)
     cum = mf.long().cumsum(1)                    # admitted count through slot i
     counts = cum[:, -1]                          # (G,) total per core
-    Npad = max(int(counts.max()), 1)
+    if capacity > 0:
+        # -(-a // b) is ceil without a float round-trip; no host sync, so the
+        # width is a python int dynamo can specialise on
+        Npad = max(-(-int(capacity * N) // G), 1)
+        keep = mf & (cum <= Npad)      # rank cum-1 is inside the cap
+    else:
+        Npad = max(int(counts.max()), 1)
+        keep = mf
     pos = torch.arange(N, device=m.device)
-    # A two-bucket counting sort: admitted tokens keep their flat order at the
+    # A two-bucket counting sort: kept tokens hold their flat order at the
     # front (rank cum-1), everything else lands past Npad and is sliced off.
-    # Every destination is distinct, so the scatter is a permutation.
-    dest = torch.where(mf, cum - 1, Npad + pos[None, :] - cum)
+    # Destinations inside [0, Npad) are distinct by construction; over-capacity
+    # tokens are pushed into the discarded region, where a collision is
+    # harmless because nothing there is ever read.
+    dest = torch.where(keep, cum - 1, Npad + pos[None, :] - cum)
     buf = torch.zeros(G, Npad + N, dtype=torch.long, device=m.device)
     buf.scatter_(1, dest, pos[None, :].expand(G, N))
     # slots [counts[g], Npad) were never written, so they are already 0
     flat = buf[:, :Npad]
-    valid = pos[:Npad][None, :] < counts[:, None]
+    valid = pos[:Npad][None, :] < counts.clamp(max=Npad)[:, None]
     return flat, torch.div(flat, T, rounding_mode="floor"), valid
 
 

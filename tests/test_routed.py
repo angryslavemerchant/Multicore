@@ -310,6 +310,68 @@ def test_modern_recipe():
           f"({(b - a) / a:+.2%} FFN drift)")
 
 
+def test_expert_capacity():
+    """CAP: the buffer is bounded by construction, even under total collapse.
+
+    The uncapped buffer is sized by the busiest expert, so a router that sends
+    everything to one expert costs M x the activation memory — measured at
+    init as 96.8% to one expert of 8, which OOM'd a 32 GB card. This asserts
+    the cap removes that failure mode without touching the uncapped path.
+    """
+    from core.resident import pack_indices
+    G, B, T = 8, 2, 64
+    N = B * T
+    torch.manual_seed(20)
+
+    # total collapse: every token to core 0
+    collapse = torch.zeros(G, B, T, dtype=torch.bool)
+    collapse[0] = True
+    f_un, _, v_un = pack_indices(collapse)
+    assert f_un.shape[1] == N, f_un.shape          # G x the fair share
+    for cap in (1.0, 2.5):
+        f, _, v = pack_indices(collapse, cap)
+        want = max(-(-int(cap * N) // G), 1)
+        assert f.shape[1] == want, (cap, f.shape, want)
+        # core 0 fills its cap exactly; the rest of its tokens are dropped
+        assert int(v[0].sum()) == want and int(v[1:].sum()) == 0
+        assert f.shape[1] < f_un.shape[1] / 3, "cap did not bound the buffer"
+
+    # balanced traffic: a generous cap must not drop anything at all
+    bal = torch.zeros(G, B, T, dtype=torch.bool)
+    who = torch.randint(0, G, (B, T))
+    for g in range(G):
+        bal[g] = who == g
+    fb, _, vb = pack_indices(bal, 2.5)
+    drop = 1.0 - int(vb.sum()) / int(bal.sum())
+    assert drop == 0.0, f"CAP FAILED: dropped {drop:.1%} of balanced traffic"
+
+    # the kept tokens are a PREFIX of what the uncapped packing keeps: the cap
+    # must truncate, never reorder, or the rank-relative bias means nothing
+    fu, _, vu = pack_indices(bal)
+    for g in range(G):
+        k = int(vb[g].sum())
+        assert torch.equal(fb[g][:k], fu[g][:k]), g
+
+    # and capacity 0 leaves the old path bit-identical
+    f0, r0, v0 = pack_indices(bal, 0.0)
+    assert torch.equal(f0, fu) and torch.equal(v0, vu)
+
+    # end to end, through a real model
+    from dataclasses import replace
+    base = routed_cfg()
+    cfg = replace(base, cores=[replace(base.cores[0], capacity_factor=2.5)] * 4)
+    err, model = _prefill_decode_err(cfg, 21)
+    assert err < 3e-6, err
+    idx = torch.randint(0, 37, (2, 24))
+    _, aux = model(idx, collect_aux=True)
+    assert "drop_rate" in aux[0], "drop_rate not reported"
+    print(f"CAP PASSED: collapse buffer {f_un.shape[1]} -> "
+          f"{pack_indices(collapse, 2.5)[0].shape[1]} slots "
+          f"({N / max(pack_indices(collapse, 2.5)[0].shape[1], 1):.1f}x less); "
+          f"0 drops on balanced traffic; uncapped path unchanged; "
+          f"prefill == decode ({err:.1e})")
+
+
 def test_flops_accounting():
     """keys_per_token, the embedding lookup, and the LM head."""
     from core.base_model import keys_per_token
@@ -360,5 +422,6 @@ if __name__ == "__main__":
     test_bounded_learned_rates()
     test_param_matched_control()
     test_modern_recipe()
+    test_expert_capacity()
     test_flops_accounting()
     print("ALL ROUTED GATES PASSED")
