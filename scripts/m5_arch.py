@@ -729,10 +729,34 @@ def main():
         cfg.cores = [replace(c, learned_tau=True) for c in cfg.cores]
     model = SWTransformer(cfg).to(device)
     if args.compile:
+        # dynamic=True ONLY when something in the graph has a data-dependent
+        # shape. The cores do: `pack_indices` sizes its buffer by the busiest
+        # expert on the batch, so static shapes would recompile every step.
+        # A dense preset has no such axis, and forcing dynamic there is a
+        # straight loss — symbolic shapes block the constant folding and
+        # tiling choices inductor makes when it knows T and B. `None` lets
+        # dynamo compile static first and fall back if a shape ever moves.
+        dyn = True if cfg.cores else None
         try:
-            model = torch.compile(model, dynamic=True)
+            compiled = torch.compile(model, dynamic=dyn)
+            # torch.compile is LAZY: it returns a wrapper and does the work on
+            # the first forward, so wrapping only the call above catches
+            # nothing and a broken inductor (no C++ toolchain, a bad triton, a
+            # kernel it cannot lower) takes the run down minutes into a rented
+            # instance. Force the compile here, at the real shape, where it can
+            # still fall back to eager and finish the run 30% slower instead of
+            # not at all.
+            model.eval()
+            with torch.no_grad(), torch.autocast(
+                    device, dtype=torch.bfloat16, enabled=(device == "cuda")):
+                compiled(torch.zeros(args.batch, T, dtype=torch.long,
+                                     device=device))
+            model = compiled
+            print(f"[compile] on, dynamic={dyn}", flush=True)
         except Exception as e:
-            print(f"torch.compile unavailable ({e}); running eager", flush=True)
+            print(f"[compile] unavailable ({type(e).__name__}: {e}); "
+                  f"running EAGER", flush=True)
+        model.train()
     raw_model = getattr(model, "_orig_mod", model)
     head_w = raw_model.head.weight
     fpt = flops_per_token(model, cfg, T)
@@ -833,8 +857,14 @@ def main():
                   {"params": taus, "weight_decay": 0.0}]
     else:
         groups = model.parameters()
-    opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.1,
-                            betas=(0.9, 0.95))
+    try:
+        opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.1,
+                                betas=(0.9, 0.95), fused=(device == "cuda"))
+    except (RuntimeError, ValueError) as e:
+        # fused rejects some param layouts; foreach is the next best thing
+        print(f"[opt] fused AdamW unavailable ({e}); using foreach", flush=True)
+        opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.1,
+                                betas=(0.9, 0.95))
     if ck is not None:
         opt.load_state_dict(ck["opt"])
         del ck                      # ~1 GB of Adam moments, already copied in
