@@ -172,6 +172,14 @@ def main():
                     help="rows per CE chunk; 0 disables chunking entirely")
     ap.add_argument("--compile-mode", default=None,
                     choices=("default", "max-autotune", "reduce-overhead"))
+    # Capacity is a DIRECT MULTIPLIER on expert FLOPs, not just a memory
+    # bound: the packed buffer is C * N/M slots per expert and the batched
+    # matmul runs over all of them, padding included (`valid` is only applied
+    # after the expert block, at scatter time). At C=2.5 with balanced routing
+    # 60% of every expert GEMM is arithmetic on padding. Sweepable here so the
+    # cost is measured rather than argued about.
+    ap.add_argument("--capacity", type=float, default=None,
+                    help="override every core's capacity_factor")
     ap.add_argument("--label", default="", help="tag for this row in the JSON")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -186,6 +194,10 @@ def main():
             print(*a, **k)
 
     cfg = presets(T)[args.preset]
+    if args.capacity is not None and cfg.cores:
+        from dataclasses import replace as _replace
+        cfg.cores = [_replace(c, capacity_factor=args.capacity)
+                     for c in cfg.cores]
     ce_chunk = (ce_chunk_default(cfg.vocab_size) if args.ce_chunk is None
                 else args.ce_chunk)
     probe = SWTransformer(cfg)
@@ -199,7 +211,9 @@ def main():
         f"{n_params/1e6:.1f}M params, {fpt/1e6:.1f}M FLOPs/token fwd, "
         f"T={T}, optimizer batch {args.step_tokens/1e3:.0f}k tokens, "
         f"compile={args.compile} mode={args.compile_mode or 'default'} "
-        f"ce_chunk={ce_chunk} {args.label}", flush=True)
+        f"ce_chunk={ce_chunk} capacity="
+        f"{cfg.cores[0].capacity_factor if cfg.cores else '-'} {args.label}",
+        flush=True)
 
     rows = []
     for micro in [int(x) for x in args.micro.split(",")]:
