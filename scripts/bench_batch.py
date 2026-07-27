@@ -37,7 +37,7 @@ from m5_arch import (ce_chunk_default, flops_per_token, presets, train_loss)
 
 
 def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
-            ce_chunk, lr=6e-4):
+            ce_chunk, lr=6e-4, compile_mode=None):
     """Steady-state seconds per OPTIMIZER step at this micro-batch."""
     torch.manual_seed(0)
     torch._dynamo.reset()          # each config gets its own static compile
@@ -50,7 +50,10 @@ def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
         # still a measurement -- it is just labelled as eager, because an
         # eager number and a compiled number are not comparable.
         try:
-            c = torch.compile(model, dynamic=True if cfg.cores else None)
+            kw = {"dynamic": True if cfg.cores else None}
+            if compile_mode:
+                kw["mode"] = compile_mode
+            c = torch.compile(model, **kw)
             with torch.no_grad(), torch.autocast(
                     device, dtype=torch.bfloat16, enabled=(device == "cuda")):
                 c(torch.zeros(micro, T, dtype=torch.long, device=device))
@@ -116,6 +119,24 @@ def main():
                     help="fraction of VRAM a config may use and still be "
                          "recommended; real runs fragment more than a "
                          "4-step benchmark does")
+    # --- spending spare VRAM. The 130M model peaks at 11.7 GB of 32 (5090) or
+    # 96 (RTX PRO 6000), so there is headroom, and headroom is a currency:
+    #   ce-chunk 0  stop chunking the cross-entropy. Chunking exists to bound
+    #               the 824 MB/sequence fp32 logits, and it costs one extra
+    #               head matmul in backward (2*d*V = 51.5M FLOPs/token, ~5% of
+    #               a step). With room to hold the logits outright, that
+    #               recompute is pure waste. Needs ~8 GB more at micro 4.
+    #   max-autotune    inductor benchmarks candidate kernel configs instead
+    #               of picking heuristically. Costs minutes of compile and
+    #               autotuning workspace; usually pays on GEMM-heavy graphs.
+    #   reduce-overhead CUDA graphs: capture the step, remove per-kernel
+    #               launch cost. Costs static buffers. Matters most at small
+    #               micro-batches, which is exactly where we landed.
+    ap.add_argument("--ce-chunk", type=int, default=None,
+                    help="rows per CE chunk; 0 disables chunking entirely")
+    ap.add_argument("--compile-mode", default=None,
+                    choices=("default", "max-autotune", "reduce-overhead"))
+    ap.add_argument("--label", default="", help="tag for this row in the JSON")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -123,7 +144,8 @@ def main():
     torch.set_float32_matmul_precision("high")
     T = args.seq_len
     cfg = presets(T)[args.preset]
-    ce_chunk = ce_chunk_default(cfg.vocab_size)
+    ce_chunk = (ce_chunk_default(cfg.vocab_size) if args.ce_chunk is None
+                else args.ce_chunk)
     probe = SWTransformer(cfg)
     fpt = flops_per_token(probe, cfg, T)
     n_params = probe.num_params()
@@ -134,7 +156,8 @@ def main():
     print(f"{args.preset} on {name} ({total_vram:.0f} GB): "
           f"{n_params/1e6:.1f}M params, {fpt/1e6:.1f}M FLOPs/token fwd, "
           f"T={T}, optimizer batch {args.step_tokens/1e3:.0f}k tokens, "
-          f"compile={args.compile}", flush=True)
+          f"compile={args.compile} mode={args.compile_mode or 'default'} "
+          f"ce_chunk={ce_chunk} {args.label}", flush=True)
 
     rows = []
     for micro in [int(x) for x in args.micro.split(",")]:
@@ -144,9 +167,10 @@ def main():
             continue
         accum = args.step_tokens // (micro * T)
         try:
-            dt, peak, cs, cok = measure(cfg, args.preset, T, micro, accum, device,
-                                   args.compile, args.steps, args.warmup,
-                                   ce_chunk)
+            dt, peak, cs, cok = measure(cfg, args.preset, T, micro, accum,
+                                        device, args.compile, args.steps,
+                                        args.warmup, ce_chunk,
+                                        compile_mode=args.compile_mode)
         except Exception as e:
             if "out of memory" not in str(e).lower() and not isinstance(
                     e, torch.OutOfMemoryError):
@@ -188,6 +212,9 @@ def main():
                                       "step_tokens": args.step_tokens,
                                       "flops_per_token": fpt,
                                       "params": n_params,
+                                      "ce_chunk": ce_chunk,
+                                      "compile_mode": args.compile_mode,
+                                      "label": args.label,
                                       "best": best, "rows": rows}), flush=True)
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
