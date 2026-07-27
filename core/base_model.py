@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from .config import ModelConfig, CoreConfig
 from .core_module import (Core, MultiCore, TokenAdapter, orthonormalize_rows_,
                           _banded_attend, _stacked, _bl)
+from .losses import ce_sum
 from .resident import pack_indices
 
 # Query-block size floor for banded attention. C = `window` is the natural
@@ -712,15 +713,21 @@ class SWTransformer(nn.Module):
             nn.init.normal_(m.weight, std=0.02)
 
     def forward(self, idx, collect_aux=False, gate_override=None,
-                return_hidden=False):
+                return_hidden=False, targets=None, ce_chunk=0):
         """idx: (B, T) -> logits (B, T, V), aux list (one dict per core).
         gate_override (B, T) bool: oracle admission for all cores.
 
         `return_hidden` returns the final normed hidden states (B, T, d)
         INSTEAD of logits, so the caller can fuse the head into a chunked
         cross-entropy. At vocab 50304 and T=4096 the fp32 logits are 824 MB
-        per sequence, which bounds the batch long before anything else does;
-        see `m5_arch.ce_sum`.
+        per sequence, which bounds the batch long before anything else does.
+
+        `targets` (B, T) computes that cross-entropy HERE and returns the mean
+        loss instead. Use this one under DistributedDataParallel: DDP hooks the
+        parameters touched inside the wrapped forward, so a loss computed
+        outside it leaves `head.weight`'s gradient un-all-reduced — and with
+        tied embeddings, racing rather than merely missing. Single-GPU callers
+        may use either; see core/losses.py.
         """
         B, T = idx.shape
         h = self.tok_emb(idx)
@@ -740,7 +747,14 @@ class SWTransformer(nn.Module):
                     else:
                         auxes.append(aux)
         h = self.ln_f(h)
-        out = h if return_hidden else self.head(h)
+        if targets is not None:
+            tgt = targets.reshape(-1)
+            out = ce_sum(h.reshape(-1, h.shape[-1]), self.head.weight, tgt,
+                         ce_chunk) / tgt.numel()
+        elif return_hidden:
+            out = h
+        else:
+            out = self.head(h)
         return (out, auxes) if collect_aux else out
 
     @torch.no_grad()

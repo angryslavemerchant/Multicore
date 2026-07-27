@@ -283,10 +283,12 @@ def cmd_search(args):
 
 def build_onstart(branch: str, train_args: str, bench_only: bool,
                   keep_alive: bool, train_script: str = None,
-                  thresholds: str = None) -> str:
+                  thresholds: str = None, nproc: int = None) -> str:
     exports = [f"export TRAIN_ARGS='{train_args}'"]
     if train_script:
         exports.append(f"export TRAIN_SCRIPT='{train_script}'")
+    if nproc and nproc > 1:
+        exports.append(f"export NPROC={nproc}")
     if thresholds:
         exports.append(f"export THRESHOLDS_FILE='{thresholds}'")
     if bench_only:
@@ -313,7 +315,8 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
 def create_instance(offer_id: int, secrets: dict, branch: str,
                     train_args: str, bench_only: bool, keep_alive: bool,
                     purpose: str, train_script: str = None,
-                    thresholds: str = None) -> int:
+                    thresholds: str = None, bid: float = None,
+                    nproc: int = None) -> int:
     wandb_project = "multicore"
     env = (f"{TEMPLATE_ENV} "
            f"-e WANDB_API_KEY={secrets['WANDB_API_KEY']} "
@@ -327,12 +330,21 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
             secrets["RCLONE_DRIVE_TOKEN"].encode()).decode()
         env += f" -e RCLONE_DRIVE_TOKEN_B64={b64}"
     onstart = build_onstart(branch, train_args, bench_only, keep_alive,
-                            train_script, thresholds)
+                            train_script, thresholds, nproc)
+    extra = []
+    if bid is not None:
+        # INTERRUPTIBLE. `--bid` turns the rental into a spot bid: outbid means
+        # the instance is STOPPED, not destroyed, and its disk survives — but
+        # vast's own guidance is that the wait to resume can be long, and the
+        # GPU can be taken on-demand by someone else in the meantime. So a
+        # spot run needs checkpoints that leave the box, not just checkpoints.
+        extra += ["--bid", str(bid)]
     result = vast("create", "instance", offer_id,
                   "--image", IMAGE,
                   "--disk", DISK_GB,
                   "--env", env,
                   "--onstart-cmd", onstart,
+                  *extra,
                   "--jupyter", "--ssh", "--direct")
     if not isinstance(result, dict) or not result.get("success"):
         raise RuntimeError(f"create instance failed: {result}")
@@ -459,8 +471,12 @@ def cmd_launch(args):
                           bench_only=False, keep_alive=args.keep_alive,
                           purpose="smoke" if args.smoke else "train",
                           train_script=args.train_script,
-                          thresholds=args.thresholds)
-    print(f"\nInstance {iid} created.")
+                          thresholds=args.thresholds,
+                          bid=getattr(args, "bid", None),
+                          nproc=getattr(args, "nproc", None))
+    print(f"\nInstance {iid} created"
+          + (f" INTERRUPTIBLE at ${args.bid}/hr." if getattr(args, "bid", None)
+             else "."))
     print(f"  watch:   python vast/launch.py logs --id {iid}")
     print(f"  destroy: python vast/launch.py destroy --id {iid}")
     print("  wandb:   project 'multicore' - run appears once training starts")
@@ -720,6 +736,16 @@ def main():
                     help="Race N boots on distinct machines; first to pass "
                          "the health gate wins, losers destroyed "
                          "(~$0.05 each). 1 = single launch, or use --offer.")
+    sp.add_argument("--nproc", type=int, default=None,
+                    help="GPUs to use; >1 runs the script under torchrun, "
+                         "which is what sets WORLD_SIZE/LOCAL_RANK for DDP")
+    sp.add_argument("--bid", type=float, default=None,
+                    help="INTERRUPTIBLE: bid this $/hr instead of renting "
+                         "on-demand. Outbid means the instance is STOPPED "
+                         "(disk preserved), not destroyed — but vast warns "
+                         "the wait to resume can be long and the GPU may be "
+                         "taken on-demand meanwhile, so only use this with a "
+                         "run that checkpoints OFF the box and auto-resumes.")
     sp.set_defaults(fn=cmd_launch)
 
     sp = sub.add_parser("scan");    common(sp)

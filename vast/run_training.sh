@@ -26,10 +26,20 @@ export WANDB_RESUME=allow
 
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-scripts/m3_mechanism.py}"
 TRAIN_ARGS="${TRAIN_ARGS:---stage all --variant core --wandb}"
-echo "TRAIN_START script=${TRAIN_SCRIPT} run_id=${WANDB_RUN_ID} args=${TRAIN_ARGS}"
 
+# Multi-GPU: NPROC>1 launches under torchrun, which sets WORLD_SIZE/LOCAL_RANK
+# for the script's ddp_setup(). Opt-in rather than auto-detected from the GPU
+# count, because "8 GPUs visible" and "this job wants 8 ranks" are different
+# statements and guessing wrong wastes a whole rental.
+NPROC="${NPROC:-1}"
+if [ "${NPROC}" -gt 1 ]; then
+    LAUNCH="$PY -m torch.distributed.run --standalone --nproc_per_node=${NPROC}"
+else
+    LAUNCH="$PY"
+fi
+echo "TRAIN_START script=${TRAIN_SCRIPT} run_id=${WANDB_RUN_ID} nproc=${NPROC} args=${TRAIN_ARGS}"
 
-"$PY" "${TRAIN_SCRIPT}" ${TRAIN_ARGS}
+${LAUNCH} "${TRAIN_SCRIPT}" ${TRAIN_ARGS}
 STATUS=$?
 echo "TRAIN_EXIT status=${STATUS}"
 

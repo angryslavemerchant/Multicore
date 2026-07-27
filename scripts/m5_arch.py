@@ -39,6 +39,7 @@ import torch
 import torch.nn.functional as F
 from core import CoreConfig, ModelConfig, SWTransformer
 from core.base_model import keys_per_token
+from core.losses import ce_chunk_default, ce_per_token, ce_sum
 from m5_data import (DEFAULT_SHARDS, IND_NGRAM_BYTES, IND_NGRAM_TOKENS,
                      induction_mask, open_data)
 
@@ -288,68 +289,6 @@ def flops_per_token(model, cfg, T, rates=None):
     return f
 
 
-def ce_chunk_default(vocab_size):
-    """Rows per cross-entropy chunk. Chunking is pure overhead at vocab 256
-    (the logits are 4 MB per sequence) and is not optional at vocab 50304
-    (824 MB per sequence, in fp32, before the backward copy), so the default
-    follows the vocabulary rather than waiting to be remembered on the CLI."""
-    return 0 if vocab_size <= 1024 else 1024
-
-
-def _ce_chunk(h, w, t):
-    return F.cross_entropy(F.linear(h, w).float(), t, reduction="sum")
-
-
-def ce_sum(h, w, targets, chunk=0):
-    """Summed next-token cross-entropy for logits = h @ w.T, without ever
-    materialising the full (N, V) fp32 logit tensor.
-
-    h (N, d), w (V, d), targets (N,). At vocab 50304 and T=4096 those logits
-    are 824 MB PER SEQUENCE in fp32 and bound the batch size long before the
-    activations do. Chunking the rows and recomputing each chunk's logits in
-    backward (torch.utils.checkpoint) caps the peak at one chunk — 206 MB at
-    chunk=1024. The price is one extra head matmul in backward: 2*d*V per
-    token, which at this shape is 51.5M FLOPs against a ~343M forward, so
-    roughly a sixth of a forward on top of a ~3x-forward backward. Memory
-    bought with a modest amount of arithmetic.
-
-    fp32 for the softmax is not the expensive part and is not negotiable —
-    bf16 has 8 mantissa bits, and a logsumexp over 50304 terms in bf16 loses
-    the small differences the loss is made of. The training itself stays bf16
-    autocast; only this reduction is widened.
-
-    chunk <= 0 is the plain path, identical to
-    F.cross_entropy(logits.float(), targets, reduction="sum").
-    """
-    N = h.shape[0]
-    if chunk <= 0 or chunk >= N:
-        return _ce_chunk(h, w, targets)
-    from torch.utils.checkpoint import checkpoint
-    total = None
-    for i in range(0, N, chunk):
-        part = checkpoint(_ce_chunk, h[i:i + chunk], w, targets[i:i + chunk],
-                          use_reentrant=False)
-        total = part if total is None else total + part
-    return total
-
-
-@torch.no_grad()
-def ce_per_token(h, w, targets, chunk=0):
-    """Per-position cross-entropy (N,) for logits = h @ w.T.
-
-    Eval only: the induction slice needs the per-position values, and with no
-    graph to keep there is nothing to checkpoint — chunking alone bounds the
-    peak."""
-    N = h.shape[0]
-    if chunk <= 0 or chunk >= N:
-        return F.cross_entropy(F.linear(h, w).float(), targets,
-                               reduction="none")
-    return torch.cat([
-        F.cross_entropy(F.linear(h[i:i + chunk], w).float(),
-                        targets[i:i + chunk], reduction="none")
-        for i in range(0, N, chunk)])
-
-
 def token_tag(tokens):
     """Filename/run-name tag for a token count: 8e8 -> '800M', 1e9 -> '1B'.
 
@@ -401,11 +340,16 @@ def train_loss(model, head_w, idx, chunk=0):
     a vocabulary bug here (the old hard-coded `reshape(-1, 256)`) returns a
     plausible finite number rather than crashing, so the only real gate is
     running this path and checking the value against ln(vocab).
+
+    The loss is computed INSIDE the model's forward (`targets=`), not from
+    returned hidden states. Under DDP that is the difference between correct
+    and silently wrong: DDP hooks the parameters touched inside the wrapped
+    forward, and a head matmul done outside it leaves `head.weight` out of the
+    all-reduce. `head_w` is kept in the signature for callers that still hold
+    one, and is unused.
     """
-    hidden, auxes = model(idx[:, :-1], collect_aux=True, return_hidden=True)
-    tgt = idx[:, 1:].reshape(-1)
-    ce = ce_sum(hidden.reshape(-1, hidden.shape[-1]), head_w, tgt,
-                chunk) / tgt.numel()
+    ce, auxes = model(idx[:, :-1], collect_aux=True, targets=idx[:, 1:],
+                      ce_chunk=chunk)
     aux = sum((a.get("router_aux_loss", 0.0) for a in auxes), start=0.0)
     return ce, aux, auxes
 

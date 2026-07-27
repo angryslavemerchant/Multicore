@@ -25,7 +25,7 @@ which token ids are in the batch.
       --micro 4,8,12,16,24,32 --step-tokens 262144 --compile \
       --total-tokens 1.08e9
 """
-import argparse, json, os, sys, time
+import argparse, contextlib, json, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -33,15 +33,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 
 from core import SWTransformer
-from m5_arch import (ce_chunk_default, flops_per_token, presets, train_loss)
+from core.losses import ce_chunk_default
+from m5_arch import flops_per_token, presets, train_loss
+
+
+def ddp_setup():
+    """(world_size, rank, local_rank). Single-process unless under torchrun."""
+    ws = int(os.environ.get("WORLD_SIZE", "1"))
+    if ws == 1:
+        return 1, 0, 0
+    import torch.distributed as dist
+    local = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local)
+    dist.init_process_group("nccl")
+    return ws, dist.get_rank(), local
+
+
+def unwrap(m):
+    """Strip torch.compile and DDP wrappers, in either order."""
+    for attr in ("_orig_mod", "module", "_orig_mod"):
+        m = getattr(m, attr, m)
+    return m
 
 
 def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
-            ce_chunk, lr=6e-4, compile_mode=None):
+            ce_chunk, lr=6e-4, compile_mode=None, world=1):
     """Steady-state seconds per OPTIMIZER step at this micro-batch."""
     torch.manual_seed(0)
     torch._dynamo.reset()          # each config gets its own static compile
     model = SWTransformer(cfg).to(device)
+    if world > 1:
+        # DDP first, then compile: dynamo's DDPOptimizer splits the graph at
+        # the gradient bucket boundaries so the all-reduce of one bucket
+        # overlaps the backward of the next. Compiling the inner module and
+        # wrapping afterwards loses that overlap.
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[torch.cuda.current_device()],
+                    gradient_as_bucket_view=True)
     compiled_ok = False
     if compile_on:
         # Force the lazy compile here so a host whose triton cannot build
@@ -61,7 +89,7 @@ def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
         except Exception as e:
             print(f"    [compile] unavailable ({type(e).__name__}); "
                   f"this row is EAGER", flush=True)
-    raw = getattr(model, "_orig_mod", model)
+    raw = unwrap(model)
     head_w = raw.head.weight
     try:
         opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1,
@@ -83,11 +111,19 @@ def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
             compile_s = time.time() - t_warm
             t0 = time.time()
         opt.zero_grad(set_to_none=True)
-        for _ in range(accum):
-            with torch.autocast(device, dtype=torch.bfloat16,
-                                enabled=(device == "cuda")):
-                ce, aux, _ = train_loss(model, head_w, idx, ce_chunk)
-            ((ce + aux) / accum).backward()
+        for a in range(accum):
+            # no_sync on every micro-step but the last: without it DDP
+            # all-reduces `accum` times per optimizer step instead of once,
+            # which at accum 16 is 16x the communication for no benefit and
+            # would make any scaling number here meaningless.
+            last = (a == accum - 1)
+            ctx = (model.no_sync() if (world > 1 and not last)
+                   else contextlib.nullcontext())
+            with ctx:
+                with torch.autocast(device, dtype=torch.bfloat16,
+                                    enabled=(device == "cuda")):
+                    ce, aux, _ = train_loss(model, head_w, idx, ce_chunk)
+                ((ce + aux) / accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
     if device == "cuda":
@@ -140,9 +176,15 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    world, rank, local = ddp_setup()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.set_float32_matmul_precision("high")
     T = args.seq_len
+
+    def say(*a, **k):
+        if rank == 0:
+            print(*a, **k)
+
     cfg = presets(T)[args.preset]
     ce_chunk = (ce_chunk_default(cfg.vocab_size) if args.ce_chunk is None
                 else args.ce_chunk)
@@ -153,24 +195,32 @@ def main():
     total_vram = (torch.cuda.get_device_properties(0).total_memory / 2 ** 30
                   if device == "cuda" else 0.0)
     name = (torch.cuda.get_device_name(0) if device == "cuda" else "cpu")
-    print(f"{args.preset} on {name} ({total_vram:.0f} GB): "
-          f"{n_params/1e6:.1f}M params, {fpt/1e6:.1f}M FLOPs/token fwd, "
-          f"T={T}, optimizer batch {args.step_tokens/1e3:.0f}k tokens, "
-          f"compile={args.compile} mode={args.compile_mode or 'default'} "
-          f"ce_chunk={ce_chunk} {args.label}", flush=True)
+    say(f"{args.preset} on {world}x {name} ({total_vram:.0f} GB each): "
+        f"{n_params/1e6:.1f}M params, {fpt/1e6:.1f}M FLOPs/token fwd, "
+        f"T={T}, optimizer batch {args.step_tokens/1e3:.0f}k tokens, "
+        f"compile={args.compile} mode={args.compile_mode or 'default'} "
+        f"ce_chunk={ce_chunk} {args.label}", flush=True)
 
     rows = []
     for micro in [int(x) for x in args.micro.split(",")]:
-        if args.step_tokens % (micro * T):
-            print(f"  micro {micro:>3}: skipped — {micro}x{T} does not divide "
-                  f"the {args.step_tokens}-token optimizer batch", flush=True)
+        # The optimizer batch is held fixed as GPUs are added, so accum falls
+        # as world grows. That is STRONG scaling and it is the demanding test:
+        # the per-rank step shrinks while the all-reduce stays the same size,
+        # so comms overhead is maximally exposed. Weak scaling (fix accum, let
+        # the batch grow with world) hides it -- and is what we would actually
+        # run, since the reference's batch is 16x ours.
+        if args.step_tokens % (micro * T * world):
+            say(f"  micro {micro:>3}: skipped — {micro}x{T}x{world} does not "
+                f"divide the {args.step_tokens}-token optimizer batch",
+                flush=True)
             continue
-        accum = args.step_tokens // (micro * T)
+        accum = args.step_tokens // (micro * T * world)
         try:
             dt, peak, cs, cok = measure(cfg, args.preset, T, micro, accum,
                                         device, args.compile, args.steps,
                                         args.warmup, ce_chunk,
-                                        compile_mode=args.compile_mode)
+                                        compile_mode=args.compile_mode,
+                                        world=world)
         except Exception as e:
             if "out of memory" not in str(e).lower() and not isinstance(
                     e, torch.OutOfMemoryError):
@@ -178,7 +228,7 @@ def main():
                       f"({type(e).__name__}: {str(e)[:120]})", flush=True)
                 torch.cuda.empty_cache()
                 continue
-            print(f"  micro {micro:>3} (accum {accum:>2}): OOM", flush=True)
+            say(f"  micro {micro:>3} (accum {accum:>2}): OOM", flush=True)
             torch.cuda.empty_cache()
             continue
         tps = args.step_tokens / dt
@@ -189,7 +239,7 @@ def main():
                      "tok_per_s": tps, "peak_gb": peak, "compile_s": cs,
                      "compiled": cok,
                      "hours": args.total_tokens / tps / 3600})
-        print(f"  micro {micro:>3} (accum {accum:>2}): {dt:7.3f} s/step  "
+        say(f"  micro {micro:>3} (accum {accum:>2}): {dt:7.3f} s/step  "
               f"{tps:>9,.0f} tok/s  {peak:5.1f} GB peak  "
               f"{rows[-1]['hours']:5.2f} h for {args.total_tokens/1e9:.2f}B  "
               f"({'compiled' if cok else 'EAGER'}, warmup {cs:.0f}s)",
@@ -201,14 +251,14 @@ def main():
             if not total_vram or r["peak_gb"] <= args.mem_headroom * total_vram]
     best = max(fits or rows, key=lambda r: r["tok_per_s"])
     slowest = min(rows, key=lambda r: r["tok_per_s"])
-    print(f"\nBEST micro-batch {best['micro']} (grad-accum {best['accum']}): "
+    say(f"\nBEST micro-batch {best['micro']} (grad-accum {best['accum']}): "
           f"{best['tok_per_s']:,.0f} tok/s, {best['peak_gb']:.1f} GB of "
           f"{total_vram:.0f}, {best['hours']:.2f} h for "
           f"{args.total_tokens/1e9:.2f}B tokens. "
           f"{best['tok_per_s']/slowest['tok_per_s']:.2f}x the worst row.",
           flush=True)
-    print("BENCH_JSON " + json.dumps({"preset": args.preset, "seq_len": T,
-                                      "gpu": name, "vram_gb": total_vram,
+    say("BENCH_JSON " + json.dumps({"preset": args.preset, "seq_len": T,
+                                      "gpu": name, "vram_gb": total_vram, "world_size": world,
                                       "step_tokens": args.step_tokens,
                                       "flops_per_token": fpt,
                                       "params": n_params,
