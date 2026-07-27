@@ -119,6 +119,26 @@ def presets(T):
             cores=[replace(routed, router_bias=True, hash_anneal_iters=2000,
                            rate_lo=0.03, rate_hi=0.30,
                            router_range_weight=1.0)] * 8),
+        # (5) the two ablations that WON, combined: three independent expert
+        # weight sets AND learnable traffic shares. Independent mechanisms —
+        # untying touches the expert weights, the bias touches the router.
+        "smoke_cores_top1_unfold_freerate": ModelConfig(
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4,
+            cores=[replace(routed, tie_loops=False, router_bias=True,
+                           hash_anneal_iters=2000, rate_lo=0.03, rate_hi=0.30,
+                           router_range_weight=1.0)] * 8),
+        # PARAM-matched control for the unfold preset (42.23M params): the same
+        # parameter budget spent DENSELY. 41.24M params (-2.3%) but 89.3M
+        # FLOPs/token = 2.04x unfold's — which is the whole claim under test,
+        # i.e. whether conditional routing reaches dense quality at half the
+        # compute. d=512/L=13 rather than the closer-on-params d=384/L=24:
+        # aspect ratio 39 is a normal transformer shape, 16 is not, and a
+        # badly-shaped opponent would flatter the cores for the wrong reason.
+        # Head dim stays 64, as in every other preset here.
+        "smoke_dense_local_pm": ModelConfig(
+            vocab_size=256, d_model=512, n_layers=13, n_heads=8, window=256,
+            max_seq_len=T, core_layer=6, cores=[]),
 
         # ---- rate sweep: SAME conditional FLOPs (rate x core params fixed),
         # trading sparsity against how much data each core param sees.

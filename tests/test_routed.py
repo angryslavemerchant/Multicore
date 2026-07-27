@@ -237,6 +237,29 @@ def test_bounded_learned_rates():
           f"dominant expert; prior anneals {scales[0]:.3f}->0; bias grad live")
 
 
+def test_param_matched_control():
+    """The dense control matches unfold on PARAMS and costs ~2x the FLOPs."""
+    from scripts.m5_arch import presets, flops_per_token
+    T = 2048
+    P = presets(T)
+    got = {}
+    for n in ("smoke_cores_top1_unfold", "smoke_dense_local_pm",
+              "smoke_cores_top1_unfold_freerate"):
+        m = SWTransformer(P[n])
+        got[n] = (m.num_params(), flops_per_token(m, P[n], T))
+    unf, pm, comb = (got[k] for k in
+                     ("smoke_cores_top1_unfold", "smoke_dense_local_pm",
+                      "smoke_cores_top1_unfold_freerate"))
+    assert abs(pm[0] - unf[0]) / unf[0] < 0.03, (pm[0], unf[0])
+    assert pm[1] / unf[1] > 1.9, pm[1] / unf[1]
+    # combining the two winners must not change the compute budget: untying
+    # touches expert weights, the router bias adds M scalars
+    assert comb[1] == unf[1] and 0 < comb[0] - unf[0] <= 64, comb
+    print(f"RT-PARAM-MATCH PASSED: dense_pm {pm[0]:,}p vs unfold {unf[0]:,}p "
+          f"({(pm[0] - unf[0]) / unf[0]:+.2%}) at {pm[1] / unf[1]:.2f}x FLOPs; "
+          f"unfold+freerate FLOPs unchanged")
+
+
 if __name__ == "__main__":
     test_top1_exact_and_gradients()
     test_top1_prefill_decode()
@@ -246,4 +269,5 @@ if __name__ == "__main__":
     test_heterogeneous_fifo()
     test_multik_compute()
     test_bounded_learned_rates()
+    test_param_matched_control()
     print("ALL ROUTED GATES PASSED")
