@@ -136,10 +136,67 @@ def test_ablation_unfold():
           f"weight sets, per-depth grad norms {[round(float(x), 4) for x in g]}")
 
 
+def test_heterogeneous_fifo():
+    """K_list gives each expert its own FIFO length at unchanged traffic."""
+    from dataclasses import replace
+    from core.base_model import _RoutedExpertBlock
+    base = routed_cfg()
+    Ks = (1, 2, 3, 6)
+    cfg = replace(base, cores=[replace(base.cores[0], K=6, K_list=Ks)] * 4)
+    err, model = _prefill_decode_err(cfg, 14)
+    assert err < 3e-6, err        # ring padded to K_max must agree step-wise
+    ex = model.cores[0].expert
+    assert ex.K == 6 and ex.Ks == list(Ks)
+    for m, km in enumerate(Ks):   # gate open inside K_m, shut past it
+        assert float(ex.k_gate[m, 0, :km].abs().max()) == 0.0
+        assert km == ex.K or float(ex.k_gate[m, 0, km:].max()) < -1e3
+
+    # Functional: expert 0 has K=1, so its output at the newest slot may not
+    # depend on ANY earlier resident. Expert 3 (K=6) must depend on them.
+    torch.manual_seed(15)
+    blk = _RoutedExpertBlock(48, replace(base.cores[0], K=6, K_list=Ks), 4)
+    x = torch.randn(4, 6, 48)
+    valid = torch.ones(4, 6, dtype=torch.bool)
+    row = torch.zeros(4, 6, dtype=torch.long)
+    with torch.no_grad():
+        a = blk.forward_packed(x, valid, row, 0)
+        # Perturb the OLDEST resident. Must NOT be a constant offset: the
+        # block layer-norms each token, which would erase it and make both
+        # assertions below pass vacuously.
+        x2 = x.clone(); x2[:, 0] = torch.randn_like(x2[:, 0]) * 3.0
+        b = blk.forward_packed(x2, valid, row, 0)
+    d_short = float((a[0, -1] - b[0, -1]).abs().max())
+    d_long = float((a[3, -1] - b[3, -1]).abs().max())
+    # Absolute size is small (residual scale is 0.1 at init and one slot of
+    # six gets diluted); the separation is what matters.
+    assert d_short < 1e-6, d_short   # K=1 expert: newest slot sees only itself
+    assert d_long > 1e-4, d_long     # K=6 expert: reaches back to slot 0
+    assert d_long > 100 * max(d_short, 1e-12), (d_short, d_long)
+    print(f"RT-MULTIK PASSED: prefill == decode ({err:.2e}); K=1 expert "
+          f"unmoved by a distant token ({d_short:.1e}), K=6 expert moves "
+          f"{d_long:.1e} ({d_long / max(d_short, 1e-12):.0f}x)")
+
+
+def test_multik_compute():
+    from scripts.m5_arch import presets, flops_per_token
+    T = 2048
+    P = presets(T)
+    out = {}
+    for n in ("smoke_cores_top1_loopmix", "smoke_cores_top1_multik"):
+        cfg = P[n]
+        out[n] = flops_per_token(SWTransformer(cfg), cfg, T)
+    rel = out["smoke_cores_top1_multik"] / out["smoke_cores_top1_loopmix"] - 1
+    assert 0 < rel < 0.01, (out, rel)   # K_max band costs a little, not a lot
+    print(f"RT-MULTIK-FLOPS PASSED: {out['smoke_cores_top1_multik']:,} vs "
+          f"{out['smoke_cores_top1_loopmix']:,} baseline ({rel:+.3%})")
+
+
 if __name__ == "__main__":
     test_top1_exact_and_gradients()
     test_top1_prefill_decode()
     test_top1_compute_match()
     test_ablation_nomix()
     test_ablation_unfold()
+    test_heterogeneous_fifo()
+    test_multik_compute()
     print("ALL ROUTED GATES PASSED")

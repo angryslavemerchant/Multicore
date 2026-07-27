@@ -25,6 +25,14 @@ class CoreConfig:
     # the stack is n_loops ordinary layers rather than one block applied
     # n_loops times. Same FLOPs, n_loops x the expert parameters.
     tie_loops: bool = True
+    # Per-expert FIFO lengths for routed cores; () means "all use K".
+    # Horizon in original-sequence positions is K/p, so with traffic held at
+    # p = 1/M, varying K per expert buys TEMPORAL diversity without touching
+    # the traffic balance — unlike varying p, which collapses (see
+    # ROUTED_CORE_NOTES.md). Implemented by padding every ring to max(K_list)
+    # and masking each expert down to its own length, so the band kernel stays
+    # single-width; costs the K_max attention term for everyone.
+    K_list: tuple = ()
     ffn_hidden: int = 0          # 0 -> ffn_mult * d_core
     inter_core_window: int = 0   # shared causal mixer window; 0 disables
     residual_scale_init: float = 0.1

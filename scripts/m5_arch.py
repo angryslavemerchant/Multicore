@@ -95,6 +95,17 @@ def presets(T):
             vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
             max_seq_len=T, core_layer=4,
             cores=[replace(routed, tie_loops=False)] * 8),
+        # (3) HETEROGENEOUS FIFO (ROUTED_CORE_NOTES.md "Important next test").
+        # Horizon = K/p. Traffic p stays pinned at 1/8 for every expert — the
+        # thing that collapses when you free it — and TEMPORAL diversity comes
+        # from K instead: horizons 128/128/256/256/512/512/1024/1024 positions.
+        # Every expert still sees the same number of training tokens, so no
+        # expert is starved and packing stays balanced.
+        "smoke_cores_top1_multik": ModelConfig(
+            vocab_size=256, d_model=384, n_layers=8, n_heads=6, window=256,
+            max_seq_len=T, core_layer=4,
+            cores=[replace(routed, K=128,
+                           K_list=(16, 16, 32, 32, 64, 64, 128, 128))] * 8),
 
         # ---- rate sweep: SAME conditional FLOPs (rate x core params fixed),
         # trading sparsity against how much data each core param sees.

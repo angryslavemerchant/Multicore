@@ -178,7 +178,14 @@ class _RoutedExpertBlock(nn.Module):
 
     def __init__(self, d: int, cfg: CoreConfig, M: int):
         super().__init__()
-        self.d, self.M, self.K = d, M, cfg.K
+        # Heterogeneous FIFO lengths: every ring is padded to K_max so the
+        # banded kernel keeps one width, and `k_gate` masks expert m down to
+        # its own K_m. Gap 0 (the token itself) is never masked, so no softmax
+        # row can be empty.
+        Ks = list(cfg.K_list) if cfg.K_list else [cfg.K] * M
+        assert len(Ks) == M and min(Ks) >= 1, Ks
+        self.Ks = Ks
+        self.d, self.M, self.K = d, M, max(Ks)
         self.n_heads = cfg.n_heads
         self.d_head = d // cfg.n_heads
         self.n_loops = cfg.n_loops
@@ -199,7 +206,15 @@ class _RoutedExpertBlock(nn.Module):
         self.f1_b = nn.Parameter(torch.zeros(S, hidden))
         self.f2_w = _stacked(S, hidden, d)
         self.f2_b = nn.Parameter(torch.zeros(S, d))
-        self.rel_bias = nn.Parameter(torch.zeros(S, cfg.n_heads, cfg.K))
+        self.rel_bias = nn.Parameter(torch.zeros(S, cfg.n_heads, self.K))
+        # Additive, non-learnable: 0 where the gap is inside that expert's
+        # FIFO, a large negative otherwise. Finite rather than -inf so an
+        # unattended run can never produce a NaN in the backward pass.
+        gate = torch.zeros(self.n_sets * M, 1, self.K)
+        for m, km in enumerate(Ks):
+            if km < self.K:
+                gate[m::M, :, km:] = -1e4
+        self.register_buffer("k_gate", gate)
         shape = (cfg.n_loops, M, d)
         self.ln1_w = nn.Parameter(torch.ones(shape))
         self.ln1_b = nn.Parameter(torch.zeros(shape))
@@ -228,7 +243,8 @@ class _RoutedExpertBlock(nn.Module):
         q = self._heads(_bl(xn, self.q_w[s], self.q_b[s]))
         k = self._heads(_bl(xn, self.k_w[s], self.k_b[s]))
         v = self._heads(_bl(xn, self.v_w[s], self.v_b[s]))
-        a = _banded_attend(q, k, v, valid, row, self.rel_bias[s],
+        a = _banded_attend(q, k, v, valid, row,
+                           self.rel_bias[s] + self.k_gate[s],
                            self.K, self.M)
         a = a.permute(0, 2, 1, 3).reshape(self.M, x.shape[1], self.d)
         x = x + self.attn_scale[loop, :, None, None] * _bl(a, self.o_w[s],
@@ -258,7 +274,8 @@ class _RoutedExpertBlock(nn.Module):
         k = heads(kn @ self.k_w[e] + self.k_b[e])
         v = heads(kn @ self.v_w[e] + self.v_b[e])
         gap = (query_rank[:, None] - kv_rank).clamp(0, self.K - 1)
-        bias = self.rel_bias[e][:, gap].permute(1, 0, 2)[:, :, None, :]
+        bias = (self.rel_bias[e] + self.k_gate[e])[:, gap] \
+            .permute(1, 0, 2)[:, :, None, :]
         bias = bias.masked_fill(~valid[:, None, None, :], float("-inf"))
         a = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         a = a.transpose(1, 2).reshape(x.shape[0], self.d)
@@ -386,7 +403,7 @@ class Top1LoopedMultiCore(nn.Module):
         return delta, aux
 
     def init_ring(self, B, device, dtype=torch.float32):
-        L, M, K, d = self.cfg.n_loops, self.M, self.cfg.K, self.d
+        L, M, K, d = self.cfg.n_loops, self.M, self.expert.K, self.d
         return {"x": torch.zeros(L, M, B, K, d, device=device, dtype=dtype),
                 "rank": torch.zeros(L, M, B, K, device=device, dtype=torch.long),
                 "count": torch.zeros(L, M, B, device=device, dtype=torch.long),
@@ -394,7 +411,7 @@ class Top1LoopedMultiCore(nn.Module):
 
     def step(self, h, cache, t=0):
         entry, x = h, h
-        ar = torch.arange(self.cfg.K, device=h.device)
+        ar = torch.arange(self.expert.K, device=h.device)
         for li in range(self.cfg.n_loops):
             pos = torch.tensor(t, device=x.device)
             _, hard, _ = self._route(x[:, None, :], pos, li)
@@ -404,13 +421,13 @@ class Top1LoopedMultiCore(nn.Module):
                 bidx = (choice == mi).nonzero(as_tuple=True)[0]
                 if bidx.numel() == 0:
                     continue
-                pos = cache["count"][li, mi, bidx] % self.cfg.K
+                pos = cache["count"][li, mi, bidx] % self.expert.K
                 rank = cache["count"][li, mi, bidx].clone()
                 cache["x"][li, mi, bidx, pos] = x[bidx]
                 cache["rank"][li, mi, bidx, pos] = rank
                 cache["count"][li, mi, bidx] += 1
                 valid = ar[None, :] < cache["count"][li, mi, bidx, None].clamp(
-                    max=self.cfg.K)
+                    max=self.expert.K)
                 out[bidx] = self.expert.step_one(
                     mi, li, x[bidx], cache["x"][li, mi, bidx], valid, rank,
                     cache["rank"][li, mi, bidx])
@@ -424,7 +441,7 @@ class Top1LoopedMultiCore(nn.Module):
     def estimated_flops_parts(self, T=None):
         d, hidden, L = self.d, self.expert.hidden, self.cfg.n_loops
         expert_linear = 2 * (4 * d * d + 2 * d * hidden)
-        expert_attention = 4 * self.cfg.K * d
+        expert_attention = 4 * self.expert.K * d
         if not self.use_mixer:
             return (L * (expert_linear + expert_attention), 0)
         mixer_linear = 2 * 4 * d * d
