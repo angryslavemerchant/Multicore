@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 from core import CoreConfig, ModelConfig, SWTransformer
 from m5_arch import (ce_chunk_default, ce_per_token, ce_sum, evaluate,
-                     train_loss)
+                     lr_schedule, train_loss)
 from m5_data import induction_mask
 
 
@@ -147,8 +147,93 @@ def test_grad_accum_matches_big_batch():
           f"worst relative gradient difference {worst:.2e} ({where})")
 
 
+def test_wsd_schedule_shapes():
+    """WSD: trunk is flat, cooldown is linear to zero, and they meet."""
+    lr, N = 2e-3, 1000
+    # a --decay-frac 0 trunk holds the peak from the end of warmup onward
+    trunk = [lr_schedule(i, lr, N, 80, "wsd", 0.0) for i in range(N + 1)]
+    assert abs(trunk[0]) < 1e-12 and abs(trunk[80] - lr) < 1e-12
+    assert all(abs(v - lr) < 1e-12 for v in trunk[80:]), "trunk is not flat"
+    # a cooldown branch starts AT the peak (no second warmup) and hits zero
+    cd = [lr_schedule(i, lr, N, 0, "cooldown") for i in range(N + 1)]
+    assert abs(cd[0] - lr) < 1e-12 and abs(cd[N]) < 1e-12
+    assert abs(cd[N // 2] - lr / 2) < 1e-9, cd[N // 2]
+    assert all(cd[i] > cd[i + 1] for i in range(N)), "cooldown not monotone"
+    # the one-run form: WSD with a 20% cooldown must trace the same path as
+    # trunk-then-branch, or the ladder is not measuring the same schedule
+    one = [lr_schedule(i, lr, N, 80, "wsd", 0.2) for i in range(N + 1)]
+    assert abs(one[N]) < 1e-12 and abs(one[800] - lr) < 1e-9
+    assert abs(one[900] - lr / 2) < 1e-3, one[900]
+    # and cosine, for contrast: its midpoint is at HALF the peak, which is
+    # exactly why a mid-run cosine checkpoint cannot be read as an endpoint
+    cos = [lr_schedule(i, lr, N, 0, "cosine") for i in range(N + 1)]
+    assert abs(cos[N // 2] - lr / 2) < 1e-9 and abs(cos[N]) < 1e-9
+    print("WSD PASSED: decay_frac 0 trunk flat at the peak, cooldown linear "
+          "peak->0 with no second warmup, one-shot wsd traces both")
+
+
+def test_checkpoint_resume_restores_optimizer():
+    """RSM: a branch resumes weights AND Adam moments AND the step count.
+
+    Restarting Adam at zero moments puts a bias-correction transient exactly
+    where the cooldown is supposed to be measuring, so the checkpoint has to
+    carry optimizer state — this asserts the resumed optimizer takes the same
+    step the uninterrupted one would.
+    """
+    import copy
+    torch.manual_seed(9)
+    V, B, T = 37, 2, 24
+    cfg = _cfg(V, cores=False)
+    m = SWTransformer(cfg)
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=0.1,
+                            betas=(0.9, 0.95))
+    batches = [_batch(V, B, T, seed=s) for s in range(5)]
+
+    def step(model, o, idx):
+        o.zero_grad(set_to_none=True)
+        ce, aux, _ = train_loss(model, model.head.weight, idx, 0)
+        (ce + aux).backward()
+        o.step()
+
+    for idx in batches[:3]:
+        step(m, opt, idx)
+    ck = {"model": copy.deepcopy(m.state_dict()),
+          "opt": copy.deepcopy(opt.state_dict())}
+    for idx in batches[3:]:                       # uninterrupted continuation
+        step(m, opt, idx)
+    want = {n: p.detach().clone() for n, p in m.named_parameters()}
+
+    m2 = SWTransformer(cfg)
+    m2.load_state_dict(ck["model"])
+    opt2 = torch.optim.AdamW(m2.parameters(), lr=1e-3, weight_decay=0.1,
+                             betas=(0.9, 0.95))
+    opt2.load_state_dict(ck["opt"])
+    assert opt2.state_dict()["state"], "RSM FAILED: no optimizer state carried"
+    for idx in batches[3:]:
+        step(m2, opt2, idx)
+    worst = max(float((want[n] - p.detach()).abs().max())
+                for n, p in m2.named_parameters())
+    assert worst < 1e-6, worst
+
+    # and the control: without the moments the same two steps land elsewhere,
+    # so the assertion above is not passing for free
+    m3 = SWTransformer(cfg)
+    m3.load_state_dict(ck["model"])
+    opt3 = torch.optim.AdamW(m3.parameters(), lr=1e-3, weight_decay=0.1,
+                             betas=(0.9, 0.95))
+    for idx in batches[3:]:
+        step(m3, opt3, idx)
+    naive = max(float((want[n] - p.detach()).abs().max())
+                for n, p in m3.named_parameters())
+    assert naive > 100 * max(worst, 1e-9), (worst, naive)
+    print(f"RSM PASSED: resumed run == uninterrupted run to {worst:.1e}; "
+          f"dropping the Adam moments diverges by {naive:.1e} ({naive/max(worst,1e-12):.0f}x)")
+
+
 if __name__ == "__main__":
     test_loss_is_ln_vocab()
     test_chunked_ce_matches()
     test_grad_accum_matches_big_batch()
+    test_wsd_schedule_shapes()
+    test_checkpoint_resume_restores_optimizer()
     print("ALL VOCAB GATES PASSED")

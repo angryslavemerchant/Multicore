@@ -350,6 +350,49 @@ def ce_per_token(h, w, targets, chunk=0):
         for i in range(0, N, chunk)])
 
 
+def token_tag(tokens):
+    """Filename/run-name tag for a token count: 8e8 -> '800M', 1e9 -> '1B'.
+
+    Shared by the checkpoint writer and the suite that has to reconstruct the
+    path. `%.0e` was the obvious choice and is wrong: it rounds 4.8e8 and
+    5.0e8 to the same '5e8', so two branch points of one ladder would collide
+    on one file and the second cooldown would silently resume the first's.
+    """
+    t = float(tokens)
+    return f"{t / 1e9:g}B" if t >= 1e9 else f"{t / 1e6:g}M"
+
+
+def lr_schedule(it, lr, iters, warmup, schedule, decay_frac=0.2,
+                final_frac=0.0):
+    """Learning rate at optimizer step `it`. Module-level so it is testable.
+
+    cosine    linear warmup, then cosine from the peak to 0. Pythia's.
+    wsd       linear warmup, then the peak held until the last `decay_frac` of
+              steps, then LINEAR to `final_frac` of the peak. open-sci-ref's
+              (verified: "constant learning rate with linear cooldown", 20%).
+              decay_frac 0 makes it a pure trunk with no cooldown at all.
+    cooldown  the branch half: no warmup, linear from the peak to `final_frac`
+              over the whole run. Meant for `--resume`ing a trunk checkpoint.
+
+    The trunk/cooldown split is what makes one run yield several honest
+    endpoints: on a constant lr the trunk is at no particular point in any
+    schedule, so branching anywhere and annealing gives the number a run of
+    that length would have reached. Reading loss off a mid-run COSINE
+    checkpoint does not — it is sitting at a high lr and reports too high.
+    """
+    if schedule == "cooldown":
+        return lr * (1 - (it / max(iters, 1)) * (1 - final_frac))
+    if it < warmup:
+        return lr * it / warmup
+    p = (it - warmup) / max(iters - warmup, 1)
+    if schedule == "cosine":
+        return lr * 0.5 * (1 + math.cos(math.pi * p))
+    start = 1.0 - decay_frac
+    if p <= start:
+        return lr
+    return lr * (1 - (p - start) / max(decay_frac, 1e-9) * (1 - final_frac))
+
+
 def train_loss(model, head_w, idx, chunk=0):
     """The training objective on one micro-batch: mean next-token CE, plus any
     router aux losses. -> (ce, router_aux, auxes).
@@ -382,7 +425,8 @@ def flops_per_token_measured(model, cfg, T, auxes):
 # ---------------------------------------------------------------- data
 def stream_batches(B, T, ind_window, device, synthetic=False, seed=0,
                    with_masks=False, split="train", data=None,
-                   data_shards=DEFAULT_SHARDS, data_dir=None, vocab_size=256):
+                   data_shards=DEFAULT_SHARDS, data_dir=None, vocab_size=256,
+                   skip=0):
     """Yields (idx (B,T+1) long, ind_mask (B,T) bool or None) forever.
 
     Non-synthetic: random contiguous windows over the cached local symbol file
@@ -399,6 +443,8 @@ def stream_batches(B, T, ind_window, device, synthetic=False, seed=0,
         g = torch.Generator().manual_seed(seed)
         n = IND_NGRAM_BYTES if vocab_size <= 256 else IND_NGRAM_TOKENS
         bits = 8 if vocab_size <= 256 else 16
+        for _ in range(skip):
+            torch.randint(0, vocab_size, (B, T + 1), generator=g)
         while True:
             idx = torch.randint(0, vocab_size, (B, T + 1), generator=g)
             masks = (torch.stack([induction_mask(idx[b, :-1], ind_window, n,
@@ -410,7 +456,7 @@ def stream_batches(B, T, ind_window, device, synthetic=False, seed=0,
     if data is None:
         data = open_data(vocab_size > 256, data_shards, data_dir)
     yield from data.batches(B, T, ind_window, device, seed=seed, split=split,
-                            with_masks=with_masks)
+                            with_masks=with_masks, skip=skip)
 
 
 # ------------------------------------------------------------- diagnostics
@@ -594,13 +640,32 @@ def main():
                          "overriding --warmup. A fixed step count cannot serve "
                          "a token ladder: 300 steps is 8% of a 1B-token run "
                          "and 79% of a 100M-token one.")
-    ap.add_argument("--schedule", choices=("cosine", "wsd"), default="cosine",
-                    help="cosine (to 0) or warmup-stable-decay. open-sci-ref "
-                         "uses WSD; Pythia uses cosine. WSD holds the peak lr "
-                         "until the last --decay-frac of steps and then "
-                         "decays linearly to --final-lr-frac of it.")
-    ap.add_argument("--decay-frac", type=float, default=0.2)
+    ap.add_argument("--schedule", choices=("cosine", "wsd", "cooldown"),
+                    default="cosine",
+                    help="cosine (to 0), warmup-stable-decay, or a bare "
+                         "cooldown. open-sci-ref uses WSD -- constant lr, then "
+                         "a LINEAR decay over the last --decay-frac -- and "
+                         "Pythia uses cosine. `cooldown` is the branch half of "
+                         "WSD: no warmup, decay from the peak over the whole "
+                         "run, for resuming a --decay-frac 0 trunk at a "
+                         "checkpoint. That is why WSD is worth the trouble: "
+                         "one trunk yields an honest endpoint at every branch "
+                         "point, where a cosine checkpoint pulled mid-run is "
+                         "sitting at a high lr and reads worse than a run of "
+                         "that length actually gets.")
+    ap.add_argument("--decay-frac", type=float, default=0.2,
+                    help="0 makes --schedule wsd a pure warmup+constant trunk")
     ap.add_argument("--final-lr-frac", type=float, default=0.0)
+    ap.add_argument("--save-at", default=None,
+                    help="comma-separated token counts to write a full "
+                         "(model + optimizer) checkpoint at, e.g. "
+                         "80e6,240e6,800e6. These are the WSD branch points.")
+    ap.add_argument("--resume", default=None,
+                    help="checkpoint to resume from: restores weights, "
+                         "OPTIMIZER STATE, and the training stream position. "
+                         "Adam moments matter -- restarting them at zero puts "
+                         "a transient right where the cooldown is supposed to "
+                         "be measuring.")
     ap.add_argument("--ce-chunk", type=int, default=None,
                     help="rows per cross-entropy chunk (see ce_sum). Default "
                          "follows the vocabulary: 0 (off) at vocab <= 1024, "
@@ -686,6 +751,28 @@ def main():
         args.iters = int(args.tokens / per_step)
     if args.warmup_frac > 0:
         args.warmup = max(1, int(args.warmup_frac * args.iters))
+    if args.schedule == "cooldown":
+        args.warmup = 0             # the trunk already warmed this model up
+
+    # ---- resume. Loaded before the streams and the optimizer are built: the
+    # stream has to fast-forward past what the trunk consumed, and the Adam
+    # moments have to land on an optimizer that already exists.
+    ck, skip, tok0 = None, 0, 0
+    if args.resume:
+        ck = torch.load(args.resume, map_location=device, weights_only=False)
+        # every one of these changes which tokens the stream yields or what
+        # the weights mean, so a mismatch is a silently wrong experiment
+        for k, mine in (("preset", args.preset), ("batch", args.batch),
+                        ("grad_accum", args.grad_accum), ("seq_len", T),
+                        ("seed", args.seed)):
+            assert ck[k] == mine, f"resume mismatch on {k}: {ck[k]} vs {mine}"
+        raw_model.load_state_dict(ck["model"])
+        skip, tok0 = ck["iter"] * ck["grad_accum"], ck["tokens"]
+        print(f"[resume] {args.resume}: step {ck['iter']}, "
+              f"{tok0/1e6:.4g}M tokens consumed; continuing the stream at "
+              f"batch {skip}", flush=True)
+    save_at = sorted(int(float(x)) for x in args.save_at.split(",")) \
+        if args.save_at else []
     print(f"{args.preset}: {n_params/1e6:.1f}M params "
           f"({n_body/1e6:.1f}M non-embedding), ~{fpt/1e6:.1f}M FLOPs/token, "
           f"{args.iters} steps x {per_step/1e6:.3f}M tokens "
@@ -731,7 +818,7 @@ def main():
     train_stream = stream_batches(args.batch, T, args.ind_window, device,
                                   synthetic=args.synthetic, seed=args.seed,
                                   split="train", data=data,
-                                  vocab_size=cfg.vocab_size)
+                                  vocab_size=cfg.vocab_size, skip=skip)
 
     # tau (only a parameter under --free-rate) is exempt from weight decay:
     # decay pulls it toward 0, and tau == 0 means "admit every token whose
@@ -748,25 +835,13 @@ def main():
         groups = model.parameters()
     opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.1,
                             betas=(0.9, 0.95))
-    def lr_at(it):
-        """Linear warmup, then cosine to 0 or WSD (hold, then linear decay).
+    if ck is not None:
+        opt.load_state_dict(ck["opt"])
+        del ck                      # ~1 GB of Adam moments, already copied in
 
-        WSD exists because open-sci-ref uses it and cosine-vs-WSD is a real
-        difference in where a run's loss sits at a fixed token count. The
-        decay SHAPE here is linear over the last `decay_frac`; open-sci-ref's
-        exact schedule is not reproduced, so this narrows the gap rather than
-        closing it — say so when reporting against them.
-        """
-        if it < args.warmup:
-            return args.lr * it / args.warmup
-        p = (it - args.warmup) / max(args.iters - args.warmup, 1)
-        if args.schedule == "cosine":
-            return args.lr * 0.5 * (1 + math.cos(math.pi * p))
-        start = 1.0 - args.decay_frac
-        if p <= start:
-            return args.lr
-        frac = (p - start) / max(args.decay_frac, 1e-9)
-        return args.lr * (1 - frac * (1 - args.final_lr_frac))
+    def lr_at(it):
+        return lr_schedule(it, args.lr, args.iters, args.warmup, args.schedule,
+                           args.decay_frac, args.final_lr_frac)
 
     # gate directions are orthogonalised once before step 1 and re-projected
     # after every step, so collapse is structurally unreachable rather than
@@ -807,6 +882,28 @@ def main():
         opt.step()
         if not args.no_ortho:
             raw_model.reproject_gates()
+        tokens_done = tok0 + it * per_step
+        # WSD branch points. `tok0` carries the trunk's count across a resume,
+        # so a checkpoint is named for the tokens the MODEL has seen, not for
+        # how far this particular process got.
+        #
+        # The `it == args.iters` clause matters: iters = int(tokens/per_step)
+        # truncates, so a run whose own budget is also a branch point (the
+        # usual case — the trunk ends exactly at the largest one) finishes up
+        # to per_step-1 tokens SHORT of it and would never write the last
+        # checkpoint. Anything within one step of the target at the final step
+        # is that target.
+        reach = tokens_done + (per_step if it == args.iters else 0)
+        while save_at and reach >= save_at[0]:
+            path = os.path.join(run_dir,
+                                f"ckpt_{token_tag(save_at.pop(0))}.pt")
+            torch.save({"model": raw_model.state_dict(), "opt": opt.state_dict(),
+                        "iter": it, "tokens": tokens_done,
+                        "preset": args.preset, "batch": args.batch,
+                        "grad_accum": args.grad_accum, "seq_len": T,
+                        "seed": args.seed, "lr": args.lr}, path)
+            print(f"CHECKPOINT {path} at {tokens_done/1e6:.4g}M tokens "
+                  f"(step {it})", flush=True)
         if it % args.eval_every == 0 or it == args.iters:
             m = evaluate(model, eval_data, device, cfg, T, ce_chunk)
             ce_mean = float(ce_acc) / args.grad_accum
@@ -814,20 +911,28 @@ def main():
             m.update({"iter": it, "loss": ce_mean + aux_mean,
                       "ce_loss": ce_mean,
                       "router_aux_loss": aux_mean,
-                      "tokens": it * per_step,
+                      "lr": lr_at(it),
+                      "tokens": tokens_done,
                       "tok_per_s": it * per_step / (time.time() - t0)})
             for ci, a in enumerate(auxes):
                 m[f"core{ci}_rate"] = float(a["rate"])
             final = m
             log(m)
-            torch.save({"model": model.state_dict(), "iter": it,
-                        "config": args.preset},
+            # raw_model, not model: under --compile the wrapper prefixes every
+            # key with _orig_mod., which no plain SWTransformer can load back
+            torch.save({"model": raw_model.state_dict(), "iter": it,
+                        "tokens": tokens_done, "config": args.preset},
                        os.path.join(run_dir, "latest.pt"))
     final["preset"] = args.preset
     final["params"] = n_params
     final["params_non_embedding"] = n_body
     final["flops_per_token"] = fpt
     final["tokens_per_step"] = per_step
+    final["schedule"] = args.schedule
+    final["lr_peak"] = args.lr
+    # a cooldown branch's loss is only interpretable next to where it branched
+    final["resumed_from"] = args.resume
+    final["tokens_at_resume"] = tok0
     # recorded so a stratified loss can never be read against runs that used a
     # different (or, pre-fix, per-config) induction reference distance -- or,
     # now, a different UNIT: 256 bytes of 8-byte context and 256 tokens of

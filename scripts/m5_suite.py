@@ -3,14 +3,28 @@ separate process (own wandb run). Fails fast if any run crashes.
 
   python scripts/m5_suite.py --tokens 1.5e9 --batch 32
 
-TOKEN LADDER. `--token-ladder 100e6,300e6,1e9` runs every preset once per
-budget, each with a COMPLETE schedule of its own (with --warmup-frac, warmup
-and cooldown both scale to the run). That is deliberately not the same thing
-as taking three checkpoints out of one 1B-token run: under any decaying
-schedule an intermediate checkpoint sits at a high learning rate and its loss
-is inflated, so it does not answer "what does a run of this length reach".
-Three real endpoints cost 1.4B tokens against 1.0B — 40% more for numbers that
-mean what they say.
+WSD LADDER (`--wsd-ladder 100e6,300e6,1e9`). ONE trunk plus one short cooldown
+per budget, which is the reason open-sci-ref picked WSD in the first place:
+constant lr means the trunk is at no particular point in any schedule, so you
+can branch off it anywhere and anneal to an honest endpoint.
+
+  trunk     warmup, then constant lr, out to (1 - decay_frac) x the largest
+            budget, writing a full checkpoint at each branch point
+  branches  resume each checkpoint (weights AND Adam moments AND the stream
+            position) and decay linearly to zero over decay_frac x that budget
+
+At 100M/300M/1B with a 20% cooldown that is a 800M trunk plus 20M + 60M + 200M
+of cooldown = 1.08B tokens, against 1.4B for three independent runs and 1.0B
+for the thing you must not do -- reading loss straight off a mid-run cosine
+checkpoint, which is sitting at high lr and reports worse than a run of that
+length actually reaches.
+
+Each finished branch has seen 0..B of the stream exactly once: the trunk gave
+it 0..0.8B and the cooldown continues at 0.8B rather than replaying.
+
+TOKEN LADDER (`--token-ladder`) is the independent-runs alternative: every
+preset run once per budget with a complete schedule of its own. More expensive
+and only needed if you want the budgets to be genuinely independent samples.
 
 --score-ref runs scripts/score_ref.py BEFORE the ladder. Two reasons, and the
 second is the practical one: it anchors our eval set to a published model, and
@@ -28,6 +42,12 @@ def main():
     ap.add_argument("--token-ladder", default=None,
                     help="comma-separated budgets, e.g. 100e6,300e6,1e9; each "
                          "preset runs once per budget with its own schedule")
+    ap.add_argument("--wsd-ladder", default=None,
+                    help="comma-separated budgets: one constant-lr trunk with "
+                         "a checkpoint per branch point, then one cooldown per "
+                         "budget. Cheaper than --token-ladder and the reason "
+                         "WSD exists. Implies --schedule wsd.")
+    ap.add_argument("--decay-frac", default="0.2")
     ap.add_argument("--batch", default="32",
                     help="passed to m5_arch as the MICRO batch")
     ap.add_argument("--grad-accum", default=None,
@@ -38,6 +58,11 @@ def main():
     ap.add_argument("--lr", default=None)
     ap.add_argument("--warmup-frac", default=None,
                     help="fraction of steps, so warmup scales with the budget")
+    ap.add_argument("--warmup", default=None,
+                    help="absolute steps. Prefer this for --wsd-ladder: one "
+                         "trunk means ONE warmup serving every rung, and a "
+                         "fraction of the trunk is a fraction of the LARGEST "
+                         "budget, which would be most of the smallest one.")
     ap.add_argument("--eval-every", default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--synthetic", action="store_true")
@@ -82,32 +107,65 @@ def main():
                 cmd += [flag, str(val)]
         run(cmd, f"score_ref@{args.score_ref}")
 
-    budgets = ([b.strip() for b in args.token_ladder.split(",")]
-               if args.token_ladder else [args.tokens])
-    for preset in args.presets:
-        for tokens in budgets:
-            cmd = [sys.executable, os.path.join(here, "m5_arch.py"),
-                   "--preset", preset, "--tokens", tokens,
-                   "--batch", args.batch, "--seq-len", args.seq_len]
-            if len(budgets) > 1:
-                # distinct wandb names, or the ladder overwrites itself
-                tag = f"{float(tokens):.0e}".replace("+0", "").replace("+", "")
-                cmd += ["--run-name", f"m5_{preset}_{tag}"]
-            for flag in ("--wandb", "--synthetic", "--compile", "--free-rate",
-                         "--no-ortho"):
-                if getattr(args, flag[2:].replace("-", "_")):
-                    cmd.append(flag)
-            for flag, val in (("--data-shards", args.data_shards),
-                              ("--data-dir", args.data_dir),
-                              ("--grad-accum", args.grad_accum),
-                              ("--schedule", args.schedule), ("--lr", args.lr),
-                              ("--warmup-frac", args.warmup_frac),
-                              ("--eval-every", args.eval_every),
-                              ("--eval-batches", args.eval_batches),
-                              ("--seed", args.seed)):
+    def base(preset, tokens, name):
+        cmd = [sys.executable, os.path.join(here, "m5_arch.py"),
+               "--preset", preset, "--tokens", f"{tokens:g}",
+               "--batch", args.batch, "--seq-len", args.seq_len,
+               "--run-name", name]
+        for flag in ("--wandb", "--synthetic", "--compile", "--free-rate",
+                     "--no-ortho"):
+            if getattr(args, flag[2:].replace("-", "_")):
+                cmd.append(flag)
+        for flag, val in (("--data-shards", args.data_shards),
+                          ("--data-dir", args.data_dir),
+                          ("--grad-accum", args.grad_accum),
+                          ("--lr", args.lr),
+                          ("--eval-every", args.eval_every),
+                          ("--eval-batches", args.eval_batches),
+                          ("--seed", args.seed)):
+            if val:
+                cmd += [flag, str(val)]
+        return cmd
+
+    sys.path.insert(0, here)
+    from m5_arch import token_tag as tag       # one namer, or paths diverge
+
+    if args.wsd_ladder:
+        budgets = sorted(float(b) for b in args.wsd_ladder.split(","))
+        df = float(args.decay_frac)
+        assert 0 < df < 1, df
+        trunk_end = budgets[-1] * (1 - df)
+        for preset in args.presets:
+            name = f"m5_{preset}_trunk"
+            cmd = base(preset, trunk_end, name)
+            cmd += ["--schedule", "wsd", "--decay-frac", "0",
+                    "--save-at", ",".join(f"{b * (1 - df):g}" for b in budgets)]
+            for flag, val in (("--warmup", args.warmup),
+                              ("--warmup-frac", args.warmup_frac)):
                 if val:
                     cmd += [flag, str(val)]
-            run(cmd, f"{preset}@{tokens}")
+            run(cmd, f"{preset}@trunk->{trunk_end:g}")
+            for b in budgets:
+                ck = os.path.join("runs", name, f"ckpt_{tag(b * (1 - df))}.pt")
+                cmd = base(preset, b * df, f"m5_{preset}_{tag(b)}")
+                cmd += ["--schedule", "cooldown", "--resume", ck]
+                run(cmd, f"{preset}@cooldown->{b:g}")
+        print("SUITE_COMPLETE", flush=True)
+        return
+
+    budgets = ([float(b) for b in args.token_ladder.split(",")]
+               if args.token_ladder else [float(args.tokens)])
+    for preset in args.presets:
+        for tokens in budgets:
+            name = (f"m5_{preset}_{tag(tokens)}" if len(budgets) > 1
+                    else f"m5_{preset}_s{args.seed or 0}")
+            cmd = base(preset, tokens, name)
+            for flag, val in (("--schedule", args.schedule),
+                              ("--warmup", args.warmup),
+                              ("--warmup-frac", args.warmup_frac)):
+                if val:
+                    cmd += [flag, str(val)]
+            run(cmd, f"{preset}@{tokens:g}")
     print("SUITE_COMPLETE", flush=True)
 
 

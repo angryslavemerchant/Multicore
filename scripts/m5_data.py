@@ -371,8 +371,16 @@ class PackedData:
         return torch.from_numpy(buf.astype(np.int32)).to(device).long()
 
     def batches(self, B, T, window, device, seed=0, split="train",
-                with_masks=False, ngram=None):
-        """Yields (idx (B,T+1) long on device, ind_mask (B,T) bool or None)."""
+                with_masks=False, ngram=None, skip=0):
+        """Yields (idx (B,T+1) long on device, ind_mask (B,T) bool or None).
+
+        `skip` advances the generator past the first `skip` batches WITHOUT
+        reading them. A resumed run has to continue the stream, not replay it
+        -- a WSD cooldown branching at 80M tokens must train on 80M..100M, so
+        that the finished model has seen 0..100M exactly once. Only the RNG
+        draw is repeated, never the gather, so fast-forwarding 15k batches
+        costs microseconds rather than the 1B symbols of I/O it stands for.
+        """
         lo, hi = self.bounds(split)
         last = hi - (T + 1)
         if last < lo:
@@ -381,6 +389,8 @@ class PackedData:
                 f"few for a {T + 1}-symbol window (build more shards)")
         n = self.ngram if ngram is None else ngram
         rng = np.random.default_rng(seed)
+        for _ in range(skip):
+            rng.integers(lo, last, size=B, endpoint=True)
         buf = np.empty((B, T + 1), dtype=self.dtype)
         while True:
             starts = rng.integers(lo, last, size=B, endpoint=True)

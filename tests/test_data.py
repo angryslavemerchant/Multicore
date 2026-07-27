@@ -175,6 +175,35 @@ def test_sampler_deterministic():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_sampler_skip_continues_stream():
+    """SKP: `skip=k` yields exactly the stream from batch k onward.
+
+    This is what makes a WSD cooldown honest. A branch resuming at 0.8B tokens
+    must train on 0.8B..1.0B, so that the finished model has seen 0..1.0B once;
+    if `skip` were off by anything the cooldown would re-train on the trunk's
+    own data and the endpoint would be a 0.8B model with a 0.2B second epoch.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _fake_cache(tmp, n=400000)
+        B, T = 3, 32
+        full = ByteData(path).batches(B, T, 8, "cpu", seed=5)
+        ref = [next(full)[0] for _ in range(12)]
+        for k in (0, 1, 7, 11):
+            it = ByteData(path).batches(B, T, 8, "cpu", seed=5, skip=k)
+            for j in range(12 - k):
+                got = next(it)[0]
+                assert torch.equal(got, ref[k + j]), (k, j)
+        # and it must actually SKIP, not restart
+        assert not torch.equal(
+            next(ByteData(path).batches(B, T, 8, "cpu", seed=5, skip=3))[0],
+            ref[0]), "SKP vacuous: skip=3 returned the first batch"
+        print("SKP PASSED: skip=k == the stream from batch k, for k in "
+              "{0,1,7,11}; no overlap and no gap at the seam")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_split_disjoint_and_contiguous():
     tmp = tempfile.mkdtemp()
     try:
@@ -369,6 +398,7 @@ if __name__ == "__main__":
     test_induction_mask_matches_loop()
     test_induction_mask_token_space()
     test_sampler_deterministic()
+    test_sampler_skip_continues_stream()
     test_split_disjoint_and_contiguous()
     test_build_byte_cache_offline()
     test_build_token_cache_offline_and_resume()
