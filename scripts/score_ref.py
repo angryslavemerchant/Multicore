@@ -22,6 +22,21 @@ in config.json), which is why `trust_remote_code=True` is required: from_
 pretrained downloads and imports modeling_opensci.py from the repo. Read it
 if that matters to you; it is a LLaMA-shaped decoder with qk-norm.
 
+TRANSFORMERS VERSION. That downloaded module was written against transformers
+4.49 and is frozen at whatever the library looked like on publication day. It
+does not import under 5.x -- `ImportError: cannot import name 'LossKwargs'`,
+observed 2026-07-27 against transformers 5.14.1. Give it its own environment
+rather than pinning the whole project back:
+
+  /venv/main/bin/python -m venv --system-site-packages /workspace/tfv4
+  /workspace/tfv4/bin/pip install "transformers==4.49.0"
+  /workspace/tfv4/bin/python scripts/score_ref.py --revision iter_0002000
+
+`--system-site-packages` so it reuses the image's torch instead of pulling a
+second multi-GB copy. m5_suite takes --score-ref-python for exactly this, and
+treats a failure here as non-fatal: this is a supplementary anchor and must
+never take down a training ladder.
+
   python scripts/score_ref.py --revision iter_0002000 --data-shards 11
   python scripts/score_ref.py --model EleutherAI/pythia-160m --batch 4
 """

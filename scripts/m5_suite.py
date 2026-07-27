@@ -83,20 +83,29 @@ def main():
                     help="hub revision of the external reference to score on "
                          "our eval set first, e.g. iter_0002000")
     ap.add_argument("--score-ref-model", default=None)
+    ap.add_argument("--score-ref-python", default=None,
+                    help="interpreter to run score_ref.py with. Published "
+                         "trust_remote_code models are pinned to the "
+                         "transformers that existed when they shipped, so the "
+                         "anchor often needs its own venv (see score_ref.py).")
     ap.add_argument("--eval-batches", default="8")
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
 
-    def run(cmd, label):
+    def run(cmd, label, fatal=True):
         print(f"SUITE_RUN {label}", flush=True)
         rc = subprocess.call(cmd)
         if rc != 0:
             print(f"SUITE_FAILED {label} rc={rc}", flush=True)
-            sys.exit(rc)
+            if fatal:
+                sys.exit(rc)
+            print(f"SUITE_CONTINUE {label} was not fatal", flush=True)
+        return rc
 
     if args.score_ref:
-        cmd = [sys.executable, os.path.join(here, "score_ref.py"),
+        cmd = [args.score_ref_python or sys.executable,
+               os.path.join(here, "score_ref.py"),
                "--revision", args.score_ref, "--seq-len", args.seq_len,
                "--batch", args.batch, "--eval-batches", args.eval_batches,
                "--out", os.path.join("runs", f"ref_{args.score_ref}.json")]
@@ -105,7 +114,12 @@ def main():
                           ("--data-dir", args.data_dir), ("--seed", args.seed)):
             if val:
                 cmd += [flag, str(val)]
-        run(cmd, f"score_ref@{args.score_ref}")
+        # NOT fatal. This is a supplementary anchor that runs somebody else's
+        # `trust_remote_code` module, pinned to whatever transformers existed
+        # when they published it -- open-sci-ref's needs 4.x and dies on 5.x.
+        # Letting that abort a multi-hour ladder on a rented GPU is the wrong
+        # trade by a very wide margin.
+        run(cmd, f"score_ref@{args.score_ref}", fatal=False)
 
     def base(preset, tokens, name):
         cmd = [sys.executable, os.path.join(here, "m5_arch.py"),
