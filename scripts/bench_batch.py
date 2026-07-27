@@ -42,8 +42,22 @@ def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
     torch.manual_seed(0)
     torch._dynamo.reset()          # each config gets its own static compile
     model = SWTransformer(cfg).to(device)
+    compiled_ok = False
     if compile_on:
-        model = torch.compile(model, dynamic=True if cfg.cores else None)
+        # Force the lazy compile here so a host whose triton cannot build
+        # (measured: a 5090 whose gcc could not link libcuda.so.1) degrades to
+        # an eager row rather than taking the whole sweep down. The row is
+        # still a measurement -- it is just labelled as eager, because an
+        # eager number and a compiled number are not comparable.
+        try:
+            c = torch.compile(model, dynamic=True if cfg.cores else None)
+            with torch.no_grad(), torch.autocast(
+                    device, dtype=torch.bfloat16, enabled=(device == "cuda")):
+                c(torch.zeros(micro, T, dtype=torch.long, device=device))
+            model, compiled_ok = c, True
+        except Exception as e:
+            print(f"    [compile] unavailable ({type(e).__name__}); "
+                  f"this row is EAGER", flush=True)
     raw = getattr(model, "_orig_mod", model)
     head_w = raw.head.weight
     try:
@@ -81,7 +95,7 @@ def measure(cfg, preset, T, micro, accum, device, compile_on, steps, warmup,
     del model, opt, idx
     if device == "cuda":
         torch.cuda.empty_cache()
-    return dt, peak, compile_s
+    return dt, peak, compile_s, compiled_ok
 
 
 def main():
@@ -130,10 +144,16 @@ def main():
             continue
         accum = args.step_tokens // (micro * T)
         try:
-            dt, peak, cs = measure(cfg, args.preset, T, micro, accum, device,
+            dt, peak, cs, cok = measure(cfg, args.preset, T, micro, accum, device,
                                    args.compile, args.steps, args.warmup,
                                    ce_chunk)
-        except torch.OutOfMemoryError:
+        except Exception as e:
+            if "out of memory" not in str(e).lower() and not isinstance(
+                    e, torch.OutOfMemoryError):
+                print(f"  micro {micro:>3} (accum {accum:>2}): FAILED "
+                      f"({type(e).__name__}: {str(e)[:120]})", flush=True)
+                torch.cuda.empty_cache()
+                continue
             print(f"  micro {micro:>3} (accum {accum:>2}): OOM", flush=True)
             torch.cuda.empty_cache()
             continue
@@ -143,11 +163,13 @@ def main():
         # under-estimate rather than a flattering one
         rows.append({"micro": micro, "accum": accum, "s_per_step": dt,
                      "tok_per_s": tps, "peak_gb": peak, "compile_s": cs,
+                     "compiled": cok,
                      "hours": args.total_tokens / tps / 3600})
         print(f"  micro {micro:>3} (accum {accum:>2}): {dt:7.3f} s/step  "
               f"{tps:>9,.0f} tok/s  {peak:5.1f} GB peak  "
               f"{rows[-1]['hours']:5.2f} h for {args.total_tokens/1e9:.2f}B  "
-              f"(compile+warmup {cs:.0f}s)", flush=True)
+              f"({'compiled' if cok else 'EAGER'}, warmup {cs:.0f}s)",
+              flush=True)
 
     if not rows:
         sys.exit("no configuration ran")
