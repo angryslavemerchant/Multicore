@@ -282,9 +282,47 @@ def test_wrapped_model_paths():
           "evaluate all survive DDP, compile(DDP) and DDP(compile) wrappers")
 
 
+def test_accumulation_uses_no_sync():
+    """SYN: the TRAINER suppresses DDP's all-reduce during accumulation.
+
+    DDP reduces gradients at the end of every backward unless wrapped in
+    no_sync(). Without it, one optimizer step costs `grad_accum` all-reduces
+    of the WHOLE parameter set instead of one. At 621.5M params that is
+    2.49 GB ring-reduced to 4.35 GB moved per GPU, per micro-step, over PCIe
+    with GeForce P2P disabled -- measured 89,960 tok/s on 8x5090 against ~260k
+    expected, with every GPU at 100% util and 285 W of a 575 W card: busy
+    moving bytes, not computing.
+
+    I had written exactly this guard in scripts/bench_batch.py, with a comment
+    explaining it, and never put it in scripts/m5_arch.py. So this gate reads
+    the TRAINER's source: a benchmark that gets it right proves nothing about
+    the thing that trains.
+    """
+    import inspect
+    import m5_arch
+    src = inspect.getsource(m5_arch.main)
+    loop = src[src.index("for a in range(args.grad_accum)"):]
+    body = loop[:loop.index("clip_grad_norm_")]
+    assert "no_sync()" in body, \
+        "SYN FAILED: the accumulation loop does not use model.no_sync()"
+    assert "not last" in body or "a < args.grad_accum - 1" in body, \
+        "SYN FAILED: no_sync must be skipped on the LAST micro-step, or the " \
+        "gradients are never all-reduced at all"
+    assert "world > 1" in body, \
+        "SYN FAILED: no_sync must be conditional on world > 1; a bare module " \
+        "has no no_sync()"
+    # and the benchmark, which is where the pattern already lived
+    import bench_batch
+    bsrc = inspect.getsource(bench_batch.measure)
+    assert "no_sync()" in bsrc, "SYN FAILED: bench_batch lost its no_sync"
+    print("SYN PASSED: both the trainer and the benchmark suppress DDP "
+          "all-reduce on every micro-step but the last")
+
+
 if __name__ == "__main__":
     test_loss_is_ln_vocab()
     test_wrapped_model_paths()
+    test_accumulation_uses_no_sync()
     test_chunked_ce_matches()
     test_grad_accum_matches_big_batch()
     test_wsd_schedule_shapes()

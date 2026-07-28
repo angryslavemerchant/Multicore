@@ -30,7 +30,7 @@ Usage:
   python scripts/m5_arch.py --preset smoke_cores --iters 200 --synthetic
   python scripts/m5_arch.py --preset base_cores --tokens 2e9 --wandb
 """
-import argparse, json, math, os, sys, time
+import argparse, contextlib, json, math, os, sys, time
 from dataclasses import replace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -998,14 +998,27 @@ def main():
         # reference's 1008 sequences) that is 63 stalls a step to log a number
         # read once every --eval-every.
         ce_acc = aux_acc = None
-        for _ in range(args.grad_accum):
+        for a in range(args.grad_accum):
             idx, _ = next(train_stream)
-            with torch.autocast(device, dtype=torch.bfloat16,
-                                enabled=(device == "cuda")):
-                ce_loss, router_aux_loss, auxes = train_loss(
-                    model, head_w, idx, ce_chunk)
-                loss = (ce_loss + router_aux_loss) / args.grad_accum
-            loss.backward()
+            # DDP all-reduces gradients at the END of every backward unless
+            # told not to. Without no_sync that is `grad_accum` all-reduces per
+            # optimizer step instead of one, and the payload is the WHOLE
+            # parameter set: 621.5M x 4 B = 2.49 GB, which ring-reduces to
+            # 2(N-1)/N = 4.35 GB moved per GPU, per micro-step. On GeForce,
+            # where P2P is disabled and it all routes through host RAM, that
+            # buried the compute completely -- measured 89,960 tok/s on 8x5090
+            # where ~260k was expected, at 100% util and only 285 W of a
+            # ~575 W card. Busy, but moving bytes rather than computing.
+            last = (a == args.grad_accum - 1)
+            sync = (model.no_sync() if (world > 1 and not last)
+                    else contextlib.nullcontext())
+            with sync:
+                with torch.autocast(device, dtype=torch.bfloat16,
+                                    enabled=(device == "cuda")):
+                    ce_loss, router_aux_loss, auxes = train_loss(
+                        model, head_w, idx, ce_chunk)
+                    loss = (ce_loss + router_aux_loss) / args.grad_accum
+                loss.backward()
             ce_d = ce_loss.detach()
             aux_d = (router_aux_loss.detach()
                      if torch.is_tensor(router_aux_loss)
