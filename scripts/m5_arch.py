@@ -361,6 +361,39 @@ def unwrap(m):
     return m
 
 
+# How many DDP gradient buckets to aim for, which is also how many pieces
+# dynamo's DDPOptimizer chops the compiled graph into. Small enough that the
+# last bucket's all-reduce still has something to hide behind, large enough
+# that inductor keeps its fusions.
+DDP_TARGET_BUCKETS = 4
+
+
+def ddp_bucket_mb(module, target=DDP_TARGET_BUCKETS):
+    """`bucket_cap_mb` for DDP, sized so the graph splits ~`target` ways.
+
+    MEASURED BUG, this is the fix. DDP's cap defaults to 25 MB, and dynamo's
+    DDPOptimizer splits the compiled graph at every bucket boundary so that
+    one bucket's all-reduce can overlap the next bucket's backward. At
+    621.5M params that is 2.49 GB of fp32 gradients -> ~99 buckets -> ~99
+    subgraphs, and every split is a hard fusion barrier. The routed model's
+    entire compile win is fusing many small gather/elementwise ops, so
+    chopping it 99 ways gives all of it back: 18,992 tok/s per GPU measured
+    on 8x5090 against 50,921 compiled on one card and 18,938 EAGER -- i.e.
+    all the way back to eager, while the GPUs sat at 380-408 W of 575 and
+    84-98% util, busy computing rather than waiting on PCIe.
+
+    The trade is worse still under accumulation: `no_sync()` means only the
+    last of `grad_accum` micro-steps all-reduces at all, so the fusion
+    penalty is paid on every micro-step to buy overlap on one in eight.
+
+    Floor at DDP's own 25 MB so this can only ever make buckets bigger.
+    """
+    grad_bytes = sum(p.numel() * p.element_size()
+                     for p in module.parameters() if p.requires_grad)
+    mb = -(-grad_bytes // (max(target, 1) * 1024 * 1024))   # ceil-div
+    return int(max(mb, 25))
+
+
 def token_tag(tokens):
     """Filename/run-name tag for a token count: 8e8 -> '800M', 1e9 -> '1B'.
 
@@ -768,6 +801,12 @@ def main():
     ap.add_argument("--data-dir", default=None,
                     help="where the byte cache lives (default runs/data)")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--ddp-bucket-mb", type=int, default=0,
+                    help="DDP bucket_cap_mb. 0 = auto, sized so dynamo's "
+                         "DDPOptimizer splits the compiled graph ~"
+                         f"{DDP_TARGET_BUCKETS} ways instead of the ~99 the "
+                         "25 MB default gives at 621.5M params "
+                         "(see ddp_bucket_mb)")
     ap.add_argument("--dynamic", choices=("auto", "true", "false"),
                     default="auto",
                     help="override torch.compile dynamic shapes. auto = "
@@ -825,8 +864,20 @@ def main():
         # DDP then compile: dynamo's DDPOptimizer splits the graph at gradient
         # bucket boundaries so one bucket's all-reduce overlaps the next
         # bucket's backward. Wrapping after compiling loses that overlap.
+        #
+        # But every one of those splits is also a fusion barrier, and the cap
+        # defaults to 25 MB -- ~99 splits at this model's size, which costs
+        # far more than the overlap pays back. See ddp_bucket_mb.
         from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[local], gradient_as_bucket_view=True)
+        bucket_mb = args.ddp_bucket_mb or ddp_bucket_mb(model)
+        nbuckets = max(1, round(
+            sum(p.numel() * p.element_size()
+                for p in model.parameters() if p.requires_grad)
+            / (bucket_mb * 1024 * 1024)))
+        model = DDP(model, device_ids=[local], gradient_as_bucket_view=True,
+                    bucket_cap_mb=bucket_mb)
+        say(f"[ddp] world={world} bucket_cap_mb={bucket_mb} "
+            f"(~{nbuckets} buckets / graph splits)", flush=True)
     if args.compile:
         # dynamic=True ONLY when something in the graph has a data-dependent
         # shape. The cores do: `pack_indices` sizes its buffer by the busiest

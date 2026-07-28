@@ -319,10 +319,84 @@ def test_accumulation_uses_no_sync():
           "all-reduce on every micro-step but the last")
 
 
+class _FakeParam:
+    def __init__(self, n, esize=4, requires_grad=True):
+        self._n, self._e = n, esize
+        self.requires_grad = requires_grad
+
+    def numel(self):
+        return self._n
+
+    def element_size(self):
+        return self._e
+
+
+class _FakeModule:
+    def __init__(self, *params):
+        self._p = params
+
+    def parameters(self):
+        return iter(self._p)
+
+
+def test_ddp_buckets_do_not_shred_the_graph():
+    """BKT: DDP's gradient buckets are sized for FUSION, not just overlap.
+
+    Wrapping DDP inside torch.compile turns on dynamo's DDPOptimizer, which
+    splits the compiled graph once per gradient bucket so each bucket's
+    all-reduce can overlap the next bucket's backward. Every split is also a
+    hard fusion barrier, and `bucket_cap_mb` defaults to 25 -- ~99 splits at
+    cores_620m's 621.5M params. Measured cost on 8x5090: 18,992 tok/s per
+    GPU against 50,921 compiled on a single card and 18,938 eager, with the
+    GPUs at 380-408 W of 575 and 84-98% util. Compute-bound and running at
+    eager speed, which is what a shredded graph looks like -- the comms-bound
+    failure this is often confused with looked completely different on the
+    same box (285 W, see SYN).
+
+    Same family of bug as SYN and WRP: correct on one GPU, wrong the moment
+    a wrapper appears, and invisible to any single-process test.
+    """
+    import inspect
+    import m5_arch
+
+    # 621.5M fp32 params, the real cores_620m gradient footprint
+    big = _FakeModule(_FakeParam(621_500_000))
+    mb = m5_arch.ddp_bucket_mb(big)
+    grad_mb = 621_500_000 * 4 / (1024 * 1024)
+    buckets = grad_mb / mb
+    assert abs(buckets - m5_arch.DDP_TARGET_BUCKETS) <= 1, (
+        f"BKT FAILED: {buckets:.0f} buckets, wanted "
+        f"~{m5_arch.DDP_TARGET_BUCKETS}")
+    assert grad_mb / 25 > 50, "BKT test is vacuous: the 25 MB default no " \
+        "longer shreds this model, so the gate proves nothing"
+
+    # frozen params must not inflate the buckets -- they never all-reduce
+    mixed = _FakeModule(_FakeParam(621_500_000),
+                        _FakeParam(10_000_000_000, requires_grad=False))
+    assert m5_arch.ddp_bucket_mb(mixed) == mb, \
+        "BKT FAILED: ddp_bucket_mb counts params that carry no gradient"
+
+    # and it may only ever raise the cap, never lower it below DDP's own
+    assert m5_arch.ddp_bucket_mb(_FakeModule(_FakeParam(1000))) == 25, \
+        "BKT FAILED: tiny models must fall back to DDP's 25 MB, not lower"
+
+    # the TRAINER has to actually pass it -- a helper nothing calls is a
+    # no-op, which is exactly how the no_sync bug survived (see SYN)
+    src = inspect.getsource(m5_arch.main)
+    ddp = src[src.index("DistributedDataParallel"):]
+    ddp = ddp[:ddp.index("if args.compile")]
+    assert "bucket_cap_mb=" in ddp, \
+        "BKT FAILED: the trainer builds DDP without bucket_cap_mb, so the " \
+        "25 MB default shreds the compiled graph again"
+    print(f"BKT PASSED: DDP buckets sized to {mb} MB -> ~{buckets:.0f} graph "
+          f"splits, not the ~{grad_mb / 25:.0f} the default gives")
+
+
 if __name__ == "__main__":
     test_loss_is_ln_vocab()
     test_wrapped_model_paths()
     test_accumulation_uses_no_sync()
+    test_ddp_buckets_do_not_shred_the_graph()
     test_chunked_ce_matches()
     test_grad_accum_matches_big_batch()
     test_wsd_schedule_shapes()
