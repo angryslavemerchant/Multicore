@@ -206,7 +206,7 @@ def presets(T):
                 residual_scale_init=0.1, router_bias=True,
                 hash_anneal_iters=2000, rate_lo=0.03, rate_hi=0.15,
                 router_range_weight=1.0, router_hash_scale=0.5,
-                capacity_factor=1.25)] * 8),
+                capacity_factor=1.25, band_block_size=64)] * 8),
 
         # Cheap token-corpus smoke tests: same shapes as the byte smoke presets
         # so the pipeline (uint16 cache, chunked CE, 4-token induction) can be
@@ -964,14 +964,33 @@ def main():
     run_name = args.run_name or f"m5_{args.preset}_s{args.seed}"
     run_dir = os.path.join("runs", run_name)
     os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join("runs", "LATEST"), "w") as f:
-        f.write(run_name)
+    if rank == 0:
+        with open(os.path.join("runs", "LATEST"), "w") as f:
+            f.write(run_name)
     wb = None
-    if args.wandb:
+    # rank 0 ONLY. Under torchrun every rank runs this file, so an unguarded
+    # init opens `world` runs for one experiment: 8 rows in the project, eight
+    # writers racing the same id (observed as wandb "409 Duplicate entry
+    # '<entity>-<runid>' for key 'runs.PRIMARY'"), and a step axis that
+    # interleaves 8 rank-local counters.
+    #
+    # Note what this does NOT do: there is no all_reduce anywhere in this
+    # file, so the metrics are rank 0's own shard, not a world aggregate.
+    # DDP averages GRADIENTS, not reported losses. That is unbiased -- every
+    # rank draws from the same stream, disjointly -- but eval_loss is over
+    # `eval_batches` windows on one rank rather than world*eval_batches, so
+    # it is sqrt(world) noisier than the run's batch size suggests. Fine for
+    # a ladder read at 100M/300M/1B, and consistent across arms because every
+    # arm reports the same way; reduce it before quoting any single eval to
+    # more decimal places than the noise supports.
+    # `wb` stays None elsewhere, which the `if wb:` guards at the log and
+    # finish sites already handle.
+    if args.wandb and rank == 0:
         import wandb
         wb = wandb.init(project="multicore", name=run_name,
                         config={**vars(args), "params": n_params,
-                                "flops_per_token": fpt})
+                                "flops_per_token": fpt,
+                                "world_size": world})
 
     def fmt(v):
         """Console rounding that does not erase the diagnostics. round(v, 5)
