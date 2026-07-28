@@ -429,11 +429,35 @@ class TokenData(PackedData):
     ngram = IND_NGRAM_TOKENS
 
 
-def open_data(tokens, n_shards=DEFAULT_SHARDS, data_dir=None):
-    """The cache for the corpus `tokens` selects, building it if needed."""
-    if tokens:
-        return TokenData(build_token_cache(n_shards, data_dir))
-    return ByteData(build_byte_cache(n_shards, data_dir))
+def open_data(tokens, n_shards=DEFAULT_SHARDS, data_dir=None, rank=0, world=1,
+              wait_s=7200):
+    """The cache for the corpus `tokens` selects, building it if needed.
+
+    ONE builder under data parallel. Every rank runs this code, and eight
+    processes building the same cache is a race, not merely waste: they share
+    one `.partial` and one `os.replace`, so the first to finish renames the
+    file out from under the others and they die with FileNotFoundError.
+    Measured on an 8x5090 launch — 50 minutes of tokenising the same 3B tokens
+    eight times, then a crash before step 1.
+
+    Rank 0 builds; the others wait for the finished file. Deliberately a
+    filesystem poll rather than `dist.barrier()`: NCCL's watchdog aborts
+    collectives that block for tens of minutes, and this build legitimately
+    takes ~50, so a barrier would trade this crash for a less legible one.
+    """
+    build = build_token_cache if tokens else build_byte_cache
+    cls = TokenData if tokens else ByteData
+    if world > 1 and rank != 0:
+        path = (token_cache_path(n_shards, data_dir) if tokens
+                else byte_cache_path(n_shards, data_dir))
+        t0 = time.time()
+        while not (os.path.exists(path) and os.path.getsize(path) > 0):
+            if time.time() - t0 > wait_s:
+                raise RuntimeError(
+                    f"rank {rank} waited {wait_s}s for rank 0 to build {path}")
+            time.sleep(10)
+        return cls(path)
+    return cls(build(n_shards, data_dir))
 
 
 # ---------------------------------------------------------------- cli

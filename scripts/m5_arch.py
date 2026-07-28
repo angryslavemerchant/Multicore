@@ -808,7 +808,7 @@ def main():
     cfg = presets(T)[args.preset]
     tokenized = cfg.vocab_size > 256
     data = None if args.synthetic else open_data(
-        tokenized, args.data_shards, args.data_dir)
+        tokenized, args.data_shards, args.data_dir, rank=rank, world=world)
     ce_chunk = (ce_chunk_default(cfg.vocab_size) if args.ce_chunk is None
                 else args.ce_chunk)
     if args.free_rate:
