@@ -206,7 +206,7 @@ def presets(T):
                 residual_scale_init=0.1, router_bias=True,
                 hash_anneal_iters=2000, rate_lo=0.03, rate_hi=0.15,
                 router_range_weight=1.0, router_hash_scale=0.5,
-                capacity_factor=1.25, band_block_size=64)] * 8),
+                capacity_factor=1.25)] * 8),
 
         # Cheap token-corpus smoke tests: same shapes as the byte smoke presets
         # so the pipeline (uint16 cache, chunked CE, 4-token induction) can be
@@ -494,11 +494,11 @@ def flops_per_token_executed(model, cfg, T):
       +25% of the expert linear term, on every step, whether or not any expert
       is near its cap.
 
-      BAND OVERSCAN. `_banded_attend` walks the K-wide band in blocks of C=K
-      queries, and a block of C queries needs W = C+K-1 contiguous keys. Every
-      query therefore scores W keys and masks away the ~half outside its own
-      K-deep FIFO. Same for the mixer's sliding window. Roughly 2x the
-      attention terms.
+      BAND OVERSCAN. A block of C queries needs W=C+K-1 contiguous keys.
+      The packed expert block size is configurable, while the mixer chooses
+      its own C. Executed attention counts W scored keys per query, including
+      padded expert queries; semantic attention counts only the requested
+      causal window.
 
     Returns (executed, semantic). The ratio is how much of a wall-clock gap is
     explained by arithmetic the implementation performs but the architecture
@@ -517,10 +517,16 @@ def flops_per_token_executed(model, cfg, T):
     expert_linear = L * 2 * (4 * d * d + n_ffn * d * hidden)
     expert_attn = L * 4 * core.expert.K * d
     extra = expert_linear * (cap - 1.0)          # padding multiplies the GEMMs
-    extra += expert_attn                         # band scans ~2x the keys
+    c = core.expert.band_block_size
+    executed_expert_attn = (
+        expert_attn * cap * (c + core.expert.K - 1) / core.expert.K)
+    extra += executed_expert_attn - expert_attn
     if core.use_mixer:
         w = cc.inter_core_window
-        extra += L * 4 * d * keys_per_token(w, T or w)
+        c = min(max(w, 64), T)
+        semantic_mixer_attn = L * 4 * d * keys_per_token(w, T or w)
+        executed_mixer_attn = L * 4 * d * (c + w - 1)
+        extra += executed_mixer_attn - semantic_mixer_attn
     return semantic + extra, semantic
 
 
