@@ -329,7 +329,13 @@ def main():
             if device == "cuda":
                 torch.cuda.synchronize()
         ka = p.key_averages()
-        sort = ("self_cuda_time_total" if device == "cuda"
+        # torch >= 2.8 renamed the profiler's CUDA accessors to device_*;
+        # 2.12 dropped the cuda_* aliases outright, so asking for
+        # `cuda_time_total` raises AttributeError and takes the whole profile
+        # report with it. Probe once and use whichever name this build has.
+        _dev = ("device" if (len(ka) and hasattr(ka[0], "self_device_time_total"))
+                else "cuda")
+        sort = (f"self_{_dev}_time_total" if device == "cuda"
                 else "self_cpu_time_total")
         # A record_function region is a CONTAINER: its SELF time is only the
         # Python overhead, and the real time lands on the leaf aten ops inside
@@ -340,7 +346,7 @@ def main():
                    "gather", "expert_block", "expert_norm_qkv",
                    "expert_banded_attn", "expert_out_proj", "expert_ffn",
                    "scatter", "mixer")
-        tot = "cuda_time_total" if device == "cuda" else "cpu_time_total"
+        tot = f"{_dev}_time_total" if device == "cuda" else "cpu_time_total"
         say(f"\n== by REGION (accum {pa}: optimizer amortised {pa}:1) ==",
             flush=True)
         say(f"{'region':<22}{'total ms':>11}{'calls':>8}{'ms/call':>10}",
