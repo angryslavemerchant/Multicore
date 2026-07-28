@@ -191,19 +191,60 @@ as written because it needs a rank-relative bias indexed by
 The mixer landing on cutlass rather than flash is an unforced loss and is the
 cheapest of the remaining fusion targets.
 
-## 7. Static compilation and compile modes — **PENDING**
+## 7. Static compilation and compile modes — **COMPLETE**
 
-Owned by a separate agent, not yet returned. What is already settled and
-should frame that table:
+`cores_620m`, seq 4096, micro 1 (accum 64), 262,144 step-tokens, capacity 1.25.
+Measured on an RTX 5090 gating at **203.4 TFLOPS** — ~14% slower than the
+232–237 TFLOPS boxes in §3, so **within-table ratios are valid, cross-box
+absolutes are not.**
 
-- `compile_dynamic()` **already auto-selects `dynamic=False`** for capacity-capped
-  routed presets, `True` uncapped, `None` dense. So `--dynamic true` is now the
-  *legacy* row, not the baseline.
-- The historical reason for dynamic shapes is gone: `pack_indices` used to size
-  its buffer by `int(counts.max())`, a host sync on a data-dependent value.
-  Capacity capping made the buffer static.
-- Expected spread on a healthy 5090: **~54,410 compiled vs 18,938 eager**. A row
-  within ~5% of 18.9k has silently fallen back to eager — check the tag per row.
+| config | s/step | tok/s | peak VRAM | compile+warmup | result |
+|---|---:|---:|---:|---:|---|
+| `dynamic=True` (legacy) | 5.343 | 49,065 | 15.8 GB | 230 s | compiled |
+| **`dynamic=False` (current default)** | 5.313 | **49,344** | 15.8 GB | **179 s** | compiled |
+| `+ reduce-overhead` | — | — | — | failed @261 s | **ERROR** |
+| `+ max-autotune` | — | — | — | failed @~24 min | **ERROR** |
+| **`+ max-autotune-no-cudagraphs`** | 4.273 / 4.280 / 4.050 | **61,346 / 61,249 / 64,726** | 15.8 GB | 494 / 233 / 203 s (warm) | compiled |
+
+Every row that ran printed `(compiled, ...)`; no silent eager fallback. No
+recompilation logged on any row.
+
+**Static shapes are a compile-time win, not a throughput win.** 49,344 vs
+49,065 is +0.6%, inside noise. The gain is 230 s → 179 s of compile (−22%).
+Keep `dynamic=False`, but not for the reason the plan assumed.
+
+**CUDA graphs are blocked by the tied embedding, and the standard remedy does
+not work.** `reduce-overhead` and `max-autotune` fail identically —
+`max-autotune` implies cudagraphs, so it burns ~24 min of autotuning and then
+dies the same way:
+
+```
+RuntimeError: Error: accessing tensor output of CUDAGraphs that has been
+overwritten by a subsequent run. Stack trace: File
+".../core/base_model.py", line 758, in forward
+    h = self.tok_emb(idx)
+Gradient addition node due to multiple use of tensor around:.
+```
+
+`tok_emb.weight` is used twice (embed and head), so backward builds a
+gradient-addition node whose cudagraph-managed buffer is overwritten by the
+next of the 64 accumulation replays. `torch.compiler.cudagraph_mark_step_begin()`
+— torch's own suggested fix — **does not help**; a paired control confirmed the
+loop change is neutral (49,143 vs 49,344). Unblocking cudagraphs requires
+untying the head or cloning the embedding output. **Untying is an ablation**,
+not a free win: it adds back the 25.75M-param table that tying removes.
+
+**The real win is max-autotune's kernel selection, reachable only with
+cudagraphs off.** `max-autotune-no-cudagraphs` gives **1.24–1.31×** at identical
+15.8 GB. Three runs: 61,346 / 61,249 / 64,726 — the first two agree to 0.16%,
+the third is 5.7% higher, so **61.3k is the conservative headline**. Note this
+mode is not in `--compile-mode`'s choices; it was driven through `measure()`
+directly and still needs a flag.
+
+**Not yet banked.** The correctness gates have not been run under
+max-autotune. Per the brief's stopping rules, the 1.24× is a measurement, not
+a result, until `tests/test_routed.py` and the other three suites pass under
+it at the §11 tolerances.
 
 ## 8–10. Fused mixer / fused expert attention / ragged grouped execution — **NOT STARTED**
 
@@ -301,10 +342,16 @@ is spent.**
    the hardest, because of the rank-relative bias.
 5. **Per-depth capacity** (§12): one global factor provisions for the worst loop.
 
-**Next highest-value experiment:** get the Stage 2 compile matrix in, then fuse
-the mixer. It is the only item that is a configuration problem rather than a
-kernel-authoring problem, and §6 already proves the current backend is
-suboptimal.
+**Next highest-value experiment:** land `max-autotune-no-cudagraphs` properly —
+add it to `--compile-mode`, run the four gate suites under it, and bank the
+1.24× (§7). It is measured, architecture-preserving, and costs a flag plus a
+~24 min cold compile. Then fuse the mixer: the only remaining item that is a
+configuration problem rather than a kernel-authoring problem, and §6 already
+proves the current backend is suboptimal.
+
+**Do not** untie the embedding to unblock CUDA graphs without pricing it. It
+would add back 25.75M params and change the model, and `max-autotune-no-cudagraphs`
+already captures the kernel-selection win without it.
 
 ## 16. Outside the brief: the multi-GPU config was cancelling the compile win
 
@@ -398,7 +445,9 @@ Capacity 1.25, micro 1, optimizer batch 262,144, seq 4096.
 | 8×5090, pre-`8ef865d` | yes | DDP, no `no_sync` | 11,245 | 0.22× | — | SYN fails |
 | 8×5090, `8ef865d` | yes | `no_sync` during accumulation | 18,992 | 0.37× | 22.7 GB | SYN, BKT fails |
 | 8×5090, `9c0a737` | yes | DDP buckets 593 MB (~4 splits) | 20,200 | 0.40× | — | all gates |
-| static | yes | static compile matrix | **PENDING** | | | |
+| static | yes | `dynamic=False` vs `True` | 49,344 vs 49,065 | 1.006× | 15.8 GB | all gates |
+| **max-autotune-no-cudagraphs** | yes | inductor kernel selection | **61,346** | **1.24×** | 15.8 GB | **NOT RUN** |
+| reduce-overhead / max-autotune | yes | CUDA graphs | — | **fails** | — | tied-embed conflict |
 | mixer | yes | fused W=256 mixer | not started | | | |
 | expert | yes | fused K=128 expert attention | not started | | | |
 | ragged | yes | actual-load grouped execution | not started | | | |
