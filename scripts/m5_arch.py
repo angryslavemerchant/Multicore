@@ -517,7 +517,13 @@ def flops_per_token_executed(model, cfg, T):
     expert_linear = L * 2 * (4 * d * d + n_ffn * d * hidden)
     expert_attn = L * 4 * core.expert.K * d
     extra = expert_linear * (cap - 1.0)          # padding multiplies the GEMMs
-    c = core.expert.band_block_size
+    # Block size of the banded expert attention. `band_block_size` is the
+    # tunable added by the fusion work; 0 (and a build that predates it) means
+    # the original one-block-per-K tiling, which is what the 389.8M/token
+    # executed figure in ROUTED_PERF.md was measured against. getattr, not a
+    # bare attribute: this must keep accounting correctly on a checkout where
+    # the tunable does not exist at all.
+    c = getattr(core.expert, "band_block_size", 0) or core.expert.K
     executed_expert_attn = (
         expert_attn * cap * (c + core.expert.K - 1) / core.expert.K)
     extra += executed_expert_attn - expert_attn
