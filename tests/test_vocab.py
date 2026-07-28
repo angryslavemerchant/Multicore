@@ -230,8 +230,61 @@ def test_checkpoint_resume_restores_optimizer():
           f"dropping the Adam moments diverges by {naive:.1e} ({naive/max(worst,1e-12):.0f}x)")
 
 
+def test_wrapped_model_paths():
+    """WRP: every helper survives a WRAPPED model, not just a bare one.
+
+    Under DDP + compile the chain is OptimizedModule -> DDP -> SWTransformer.
+    A helper that unwraps only `_orig_mod` lands on the DDP wrapper, and
+    `model.cores` raises AttributeError. This cost two failed launches on a
+    rented 8x5090 because no single-GPU test has a wrapper to trip over: the
+    bug is invisible until eight processes are already running.
+
+    Stands in for DDP with a plain nn.Module wrapper exposing `.module`, which
+    is the attribute the unwrap chain has to strip. No GPUs required.
+    """
+    import torch.nn as nn
+    from m5_arch import (evaluate, flops_per_token, flops_per_token_executed,
+                         unwrap)
+
+    class FakeDDP(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.module = m
+
+        def forward(self, *a, **k):
+            return self.module(*a, **k)
+
+    class FakeCompiled(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self._orig_mod = m
+
+        def forward(self, *a, **k):
+            return self._orig_mod(*a, **k)
+
+    V, T = 37, 24
+    cfg = _cfg(V)
+    bare = SWTransformer(cfg)
+    for name, wrapped in (("DDP", FakeDDP(bare)),
+                          ("compile(DDP)", FakeCompiled(FakeDDP(bare))),
+                          ("DDP(compile)", FakeDDP(FakeCompiled(bare)))):
+        assert unwrap(wrapped) is bare, f"unwrap failed for {name}"
+        # the helpers that reach for .cores / .num_params / .tok_emb / .head
+        f = flops_per_token(wrapped, cfg, T)
+        assert f == flops_per_token(bare, cfg, T), name
+        ex, sem = flops_per_token_executed(wrapped, cfg, T)
+        assert ex >= sem > 0, name
+        idx = _batch(V, 2, T, seed=2)
+        mask = torch.zeros(2, T, dtype=torch.bool)
+        m = evaluate(wrapped, [(idx, mask)], "cpu", cfg, T, chunk=0)
+        assert abs(m["eval_loss"] - math.log(V)) < 0.3, (name, m["eval_loss"])
+    print("WRP PASSED: unwrap, flops_per_token, flops_per_token_executed and "
+          "evaluate all survive DDP, compile(DDP) and DDP(compile) wrappers")
+
+
 if __name__ == "__main__":
     test_loss_is_ln_vocab()
+    test_wrapped_model_paths()
     test_chunked_ce_matches()
     test_grad_accum_matches_big_batch()
     test_wsd_schedule_shapes()

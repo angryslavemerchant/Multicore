@@ -306,24 +306,28 @@ def flops_per_token(model, cfg, T, rates=None):
     exactly the per-core sum. That also keeps this arithmetic identical to the
     pre-`rates` version whenever rates == target_rate, measured or not.
     """
-    raw = getattr(model, "_orig_mod", model)
+    # `raw` everywhere below, never `model`: under DDP + compile the chain is
+    # OptimizedModule -> DistributedDataParallel -> SWTransformer, so a bare
+    # `model.cores` resolves onto the DDP wrapper and raises. Single-GPU runs
+    # cannot catch this -- there is no DDP wrapper to trip over.
+    raw = unwrap(model)
     core_params = sum(sum(p.numel() for p in c.parameters())
-                      for c in model.cores)
+                      for c in raw.cores)
     emb = raw.tok_emb.weight.numel()
     if raw.pos_emb is not None:
         emb += raw.pos_emb.weight.numel()
-    base_params = model.num_params() - core_params - emb
+    base_params = raw.num_params() - core_params - emb
     f = 2 * base_params
     if cfg.tie_embeddings:      # the head IS the table we just subtracted
         f += 2 * cfg.d_model * cfg.vocab_size
     f += cfg.n_layers * 4 * cfg.d_model * keys_per_token(cfg.window, T)
-    routed = [c for c in model.cores if getattr(c, "is_top1_routed", False)]
+    routed = [c for c in raw.cores if getattr(c, "is_top1_routed", False)]
     if routed:
-        assert len(routed) == 1 and len(model.cores) == 1
+        assert len(routed) == 1 and len(raw.cores) == 1
         return f + routed[0].estimated_flops_per_token(T)
 
     i = 0
-    for c, cc in zip(model.cores, cfg.cores):
+    for c, cc in zip(raw.cores, cfg.cores):
         n = getattr(c, "M", 1)                     # cores inside this module
         r = cc.target_rate if rates is None else sum(rates[i:i + n]) / n
         i += n
@@ -467,7 +471,7 @@ def flops_per_token_executed(model, cfg, T):
     explained by arithmetic the implementation performs but the architecture
     does not ask for.
     """
-    raw = getattr(model, "_orig_mod", model)
+    raw = unwrap(model)
     semantic = flops_per_token(model, cfg, T)
     routed = [c for c in raw.cores if getattr(c, "is_top1_routed", False)]
     if not routed:
@@ -577,7 +581,7 @@ def core_diagnostics(model, auxes):
     Cosines come off the parameters, so they are exact; Jaccard and the delta
     ratio come off one eval batch's masks/deltas.
     """
-    raw = getattr(model, "_orig_mod", model)
+    raw = unwrap(model)
     out = {}
     if not auxes:
         return out
@@ -657,7 +661,7 @@ def core_diagnostics(model, auxes):
 # ---------------------------------------------------------------- train
 def evaluate(model, eval_data, device, cfg=None, T=None, chunk=0):
     model.eval()
-    head_w = getattr(model, "_orig_mod", model).head.weight
+    head_w = unwrap(model).head.weight
     tot, tot_n, ind, ind_n = 0.0, 0, 0.0, 0
     diag = {}
     with torch.no_grad():
@@ -675,7 +679,7 @@ def evaluate(model, eval_data, device, cfg=None, T=None, chunk=0):
                 if auxes and cfg is not None:
                     diag["flops_per_token_measured"] = \
                         flops_per_token_measured(model, cfg, T, auxes)
-                    raw = getattr(model, "_orig_mod", model)
+                    raw = unwrap(model)
                     routed = [c for c in raw.cores if
                               getattr(c, "is_top1_routed", False)]
                     if routed and "pack_util" in diag:
@@ -857,7 +861,7 @@ def main():
     raw_model = unwrap(model)
     head_w = raw_model.head.weight
     fpt = flops_per_token(model, cfg, T)
-    n_params = model.num_params()
+    n_params = raw_model.num_params()
     # Non-embedding params: the number that is comparable across vocabularies.
     # Embeddings scale V*d and the body scales L*d^2, so at vocab 50304 the
     # (V, d) table is 25.75M of a 125M "0.13B" model -- quoting totals would
