@@ -62,7 +62,20 @@ TEMPLATE_ENV = (
     "localhost:8384:18384:/:Syncthing|"
     'localhost:6006:16006:/:Tensorboard"'
 )
-DISK_GB   = 45
+# Default instance disk. 45 GB was the old value and it is NOT enough for a
+# cores_620m ladder: a 45 GB box filled to 32 KB free and killed a run mid
+# backward-compile with `OSError: [Errno 28] No space left on device` in
+# /tmp/torchinductor_root. The budget that actually has to fit:
+#
+#   docker image                                  ~20 GB
+#   token cache, 4 shards                           6.0
+#   HF parquet staged during the cache build        8.1
+#   inductor/triton cache (grows per recompile)     5-15
+#   full checkpoints: 621.5M params fp32 + 2 Adam
+#     moments = 7.5 GB EACH, and --save-at has 3   22.4
+#
+# ~64 GB before slack, and the inductor cache is unbounded across relaunches.
+DISK_GB   = 150
 
 # SmallCore is a ~50k-parameter model with no dataset: it generates its own
 # walks in-process. It is kernel-launch bound on the sequential position
@@ -346,9 +359,17 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
                   "--onstart-cmd", onstart,
                   *extra,
                   "--jupyter", "--ssh", "--direct")
-    if not isinstance(result, dict) or not result.get("success"):
-        raise RuntimeError(f"create instance failed: {result}")
-    iid = result["new_contract"]
+    # RECORD FIRST, JUDGE SECOND. A bid (interruptible) create returns
+    # success=False alongside a perfectly live `new_contract`; raising on that
+    # before saving state produced a running 8x5090 that `status` could not
+    # see and `destroy --all` could not reach. Any contract id we are handed
+    # is a billing instance, so it goes into state whatever the flag says.
+    iid = result.get("new_contract") if isinstance(result, dict) else None
+    if iid is None:
+        raise RuntimeError(f"create instance failed with no contract: {result}")
+    if not result.get("success"):
+        print(f"WARNING: create reported success=False but returned contract "
+              f"{iid}; tracking it anyway — verify with `status`", flush=True)
 
     records = load_state()
     records.append({
