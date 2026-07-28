@@ -209,6 +209,19 @@ def build_token_cache(n_shards=DEFAULT_SHARDS, data_dir=None, repo_id=REPO_ID,
         print(f"[data] cache hit: {out} ({n} tokens, {n / 1e9:.2f}B)",
               flush=True)
         return out
+    # Drive before tokenising: the pull is ~90 s against ~58 min of CPU for
+    # 5 shards. Failure here is not an error -- try_pull never raises, and a
+    # False just means this box builds the cache the slow way (and can then
+    # publish it with scripts/build_upload_cache.py).
+    try:
+        from drive_cache import try_pull
+    except ImportError:
+        try_pull = None
+    if try_pull is not None and try_pull(out):
+        n = os.path.getsize(out) // 2
+        print(f"[data] drive hit: {out} ({n} tokens, {n / 1e9:.2f}B)",
+              flush=True)
+        return out
     import pyarrow.parquet as pq
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     tmp, prog = out + ".partial", out + ".progress"
