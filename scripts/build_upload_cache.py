@@ -38,9 +38,16 @@ def make_rclone_conf(token):
 
 
 def rclone_upload(local_path, remote_folder, conf_path):
+    # 256M chunks, NOT the 8M default. Drive cannot resume a resumable-upload
+    # session mid-file, so one failed chunk restarts the whole transfer -- and
+    # at 8M a 7 GB cache is ~900 sequential chunks, which reliably lost the
+    # race. Measured 2026-07-28: the default burned all three retries (21 GB
+    # transferred, nothing committed) in 12 minutes; 256M committed in 2m23s
+    # at 64 MB/s on the first attempt.
     dest = f"gdrive:{remote_folder}/"
     cmd = ["rclone", "copy", local_path, dest,
-           "--config", conf_path, "-v", "--stats", "15s"]
+           "--config", conf_path, "--drive-chunk-size", "256M",
+           "-v", "--stats", "15s"]
     print(f"[cache-upload] uploading {local_path} -> {dest}", flush=True)
     t0 = time.time()
     subprocess.run(cmd, check=True)
