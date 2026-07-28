@@ -405,6 +405,12 @@ failure — but "compute-bound" was read as "the *model* is computing", when a
 third of it is a 621.5M-param gradient-norm reduction and optimizer update,
 which draw power too.
 
+**Confirmed on a live single-GPU ladder.** Same preset, same 262,144 optimizer
+batch, `grad_accum=64`, no DDP: **53,500 tok/s steady** over 900 steps
+(53,166–53,711, ±0.5%). So one 5090 does **2.65× the per-GPU throughput** of a
+GPU in the 8-way job (20,200), and eight GPUs return **3.02× of one — 38%
+scaling efficiency**. This is the strong-scaling ceiling, not a defect.
+
 **Consequence for planning: 50,921/GPU was never reachable at this scaling
 point.** 8×5090 at a fixed 262k global batch is near its strong-scaling limit
 for this model, and the limit is O(params) per-step work, not compile quality.
@@ -440,6 +446,7 @@ Capacity 1.25, micro 1, optimizer batch 262,144, seq 4096.
 
 | revision | exact architecture? | change | tok/s | speedup vs routed baseline | peak VRAM | tests |
 |---|---:|---|---:|---:|---:|---|
+| **1 GPU, compiled, live ladder** | yes | `grad_accum=64`, no DDP | **53,500** | **1.05×** | — | all gates |
 | baseline (1 GPU, eager) | yes | current implementation | 18,938 | 0.37× | 15.9 GB | all gates |
 | **baseline (1 GPU, compiled)** | yes | `torch.compile`, `dynamic=False` auto | **50,921–54,410** | **1.00×** | 15.7–15.9 GB | all gates |
 | 8×5090, pre-`8ef865d` | yes | DDP, no `no_sync` | 11,245 | 0.22× | — | SYN fails |
